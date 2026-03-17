@@ -19,7 +19,7 @@ TTY_INPUT="/dev/tty"
 [ -r "$TTY_INPUT" ] || TTY_INPUT="/dev/stdin"
 
 say() { printf '%s\n' "$*"; }
-warn() { printf '⚠️  %s\n' "$*" >&2; }
+warn() { printf '⚠️ %s\n' "$*" >&2; }
 die() { printf '❌ %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "Запускайте этот скрипт от root"
@@ -29,55 +29,39 @@ ask() {
   local default="${2-}"
   local answer
   if [ -n "$default" ]; then
-    IFS= read -r -p "$prompt [$default]: " answer <"$TTY_INPUT"
+    read -r -p "$prompt [$default]: " answer < "$TTY_INPUT"
     printf '%s' "${answer:-$default}"
   else
-    IFS= read -r -p "$prompt: " answer <"$TTY_INPUT"
+    read -r -p "$prompt: " answer < "$TTY_INPUT"
     printf '%s' "$answer"
   fi
 }
 
-ask_secret() {
-  local prompt="$1"
-  local answer
-  IFS= read -r -s -p "$prompt: " answer <"$TTY_INPUT"
-  printf '\n' >&2
-  printf '%s' "$answer"
-}
-
-ask_menu() {
-  local prompt="$1"
-  local answer
-  IFS= read -r -p "$prompt: " answer <"$TTY_INPUT"
-  printf '%s' "$answer"
-}
-
-ask_confirm() {
-  local prompt="$1"
-  local answer
-  IFS= read -r -p "$prompt [y/N]: " answer <"$TTY_INPUT"
-  [[ "$answer" =~ ^([yY]|[дД])$ ]]
-}
-
-require_file() {
-  [ -f "$1" ] || die "Не найден файл: $1"
+pause_if_needed() {
+  :
 }
 
 install_base_deps() {
-  local pkgs=()
-  local p
-  for p in git curl openssl ca-certificates python3 tar gzip sed awk grep coreutils util-linux passwd; do
-    dpkg -s "$p" >/dev/null 2>&1 || pkgs+=("$p")
-  done
-  if [ ${#pkgs[@]} -gt 0 ]; then
-    say "📦 Устанавливаем зависимости: ${pkgs[*]}"
-    apt-get update -qq
-    apt-get install -yqq "${pkgs[@]}"
-  fi
-}
-
-compose() {
-  docker compose "$@"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  local pkgs=(
+    ca-certificates
+    curl
+    git
+    openssl
+    python3
+    python3-venv
+    tar
+    gzip
+    sed
+    grep
+    coreutils
+    util-linux
+    passwd
+    systemd
+    jq
+  )
+  apt-get install -yqq "${pkgs[@]}"
 }
 
 ensure_docker() {
@@ -87,13 +71,13 @@ ensure_docker() {
   fi
 
   if ! docker compose version >/dev/null 2>&1; then
-    say "📦 Устанавливаем Docker Compose plugin v2"
+    say "📦 Устанавливаем Docker Compose v2"
     apt-get update -qq
-    apt-get install -yqq docker-compose-plugin
+    apt-get install -yqq docker-compose-plugin || true
   fi
 
-  docker version >/dev/null 2>&1 || die "Docker установлен, но недоступен"
-  docker compose version >/dev/null 2>&1 || die "Не найден Docker Compose v2 (команда docker compose)"
+  docker version >/dev/null 2>&1 || die "Docker недоступен"
+  docker compose version >/dev/null 2>&1 || die "Нужен Docker Compose v2 (команда docker compose)"
 }
 
 ensure_rust() {
@@ -103,69 +87,136 @@ ensure_rust() {
   fi
   # shellcheck disable=SC1090
   [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
-  command -v cargo >/dev/null 2>&1 || die "cargo не найден после установки rustup"
+  command -v cargo >/dev/null 2>&1 || die "cargo не найден после установки Rust"
 }
 
-choose_source_channel() {
-  say "Какую версию брать из исходников?"
-  say "  1) Последний стабильный тег"
-  say "  2) Ветка main"
-  case "$(ask_menu 'Выберите (1-2)')" in
+choose_branch_mode() {
+  say ""
+  say "Выберите ветку Telemt:"
+  say "1) LTS / стабильный релиз"
+  say "2) Latest / самый свежий релиз"
+  local ch
+  ch=$(ask "Выберите пункт" "1")
+  case "$ch" in
     1) printf 'stable' ;;
-    2) printf 'main' ;;
-    *) die "Неверный выбор" ;;
+    2) printf 'latest' ;;
+    *) printf 'stable' ;;
+  esac
+}
+
+choose_docker_source() {
+  say ""
+  say "Как обновлять / ставить Docker-версию Telemt:"
+  say "1) Docker pull готового образа"
+  say "2) Сборка Docker-образа из исходников"
+  local ch
+  ch=$(ask "Выберите пункт" "1")
+  case "$ch" in
+    1) printf 'pull' ;;
+    2) printf 'build' ;;
+    *) printf 'pull' ;;
   esac
 }
 
 clone_telemt_source() {
-  local channel="$1"
+  local branch_mode="$1"
   rm -rf "$BUILD_DIR"
   mkdir -p "$WORK_DIR"
   git clone https://github.com/telemt/telemt.git "$BUILD_DIR"
-  pushd "$BUILD_DIR" >/dev/null
-  if [ "$channel" = "stable" ]; then
-    local ref
-    ref="$(git tag --sort=-v:refname | grep -E '^[0-9]+(\.[0-9]+){2,}$' | head -n1 || true)"
-    [ -n "$ref" ] || die "Не удалось определить стабильный тег Telemt"
-    say "📌 Checkout stable tag: $ref"
-    git checkout "$ref"
+  cd "$BUILD_DIR"
+
+  local tag=""
+  if [ "$branch_mode" = "stable" ]; then
+    tag=$(git tag --sort=-v:refname | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
   else
-    say "📌 Checkout branch: main"
+    tag=$(git tag --sort=-creatordate | head -n1 || true)
+  fi
+
+  if [ -n "$tag" ]; then
+    git checkout "$tag"
+  else
     git checkout main
   fi
-  popd >/dev/null
 }
 
-build_native_binary() {
-  local channel="$1"
-  install_base_deps
-  ensure_rust
-  clone_telemt_source "$channel"
-  pushd "$BUILD_DIR" >/dev/null
-  cargo build --release
-  install -m 0755 target/release/telemt "$NATIVE_BINARY"
-  popd >/dev/null
+hex_domain() {
+  python3 - "$1" <<'PY'
+import sys
+print(sys.argv[1].encode().hex())
+PY
 }
 
-build_docker_image() {
-  local channel="$1"
-  install_base_deps
-  ensure_docker
-  clone_telemt_source "$channel"
-  docker build -t "$DOCKER_IMAGE" "$BUILD_DIR"
+read_cfg_value() {
+  local cfg="$1"
+  local key="$2"
+  python3 - "$cfg" "$key" <<'PY'
+from pathlib import Path
+import sys, re
+p = Path(sys.argv[1])
+key = sys.argv[2]
+if not p.exists():
+    raise SystemExit(0)
+text = p.read_text(errors='ignore')
+m = re.search(rf'(?m)^\s*{re.escape(key)}\s*=\s*"([^"]*)"', text)
+print(m.group(1) if m else "")
+PY
 }
 
-ensure_native_layout() {
-  install_base_deps
-  if ! id "$NATIVE_USER" >/dev/null 2>&1; then
+current_external_ip() {
+  local ip
+  ip=$(curl -fsS --max-time 8 -4 https://api.ipify.org 2>/dev/null || true)
+  [ -n "$ip" ] || ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
+  printf '%s' "$ip"
+}
+
+native_installed() {
+  [ -f "$NATIVE_CONFIG" ] || [ -x "$NATIVE_BINARY" ] || systemctl list-unit-files 2>/dev/null | grep -q "^${NATIVE_SERVICE}\.service"
+}
+
+native_running() {
+  systemctl is-active --quiet "$NATIVE_SERVICE" 2>/dev/null
+}
+
+docker_installed() {
+  [ -f "$WORK_DIR/docker-compose.yml" ] || docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${DOCKER_CONTAINER}$"
+}
+
+docker_running() {
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${DOCKER_CONTAINER}$"
+}
+
+panel_installed() {
+  [ -f "$PANEL_CONFIG" ] || [ -x "$PANEL_BINARY" ] || systemctl list-unit-files 2>/dev/null | grep -q "^${PANEL_SERVICE}\.service"
+}
+
+panel_running() {
+  systemctl is-active --quiet "$PANEL_SERVICE" 2>/dev/null
+}
+
+active_mode() {
+  if docker_running; then
+    printf 'docker'
+  elif native_running; then
+    printf 'service'
+  elif docker_installed; then
+    printf 'docker-stopped'
+  elif native_installed; then
+    printf 'service-stopped'
+  else
+    printf 'none'
+  fi
+}
+
+ensure_native_user() {
+  if ! id -u "$NATIVE_USER" >/dev/null 2>&1; then
     useradd -d "$NATIVE_HOME" -m -r -U "$NATIVE_USER"
   fi
-  mkdir -p "$NATIVE_DIR" "$NATIVE_HOME"
-  chown -R "$NATIVE_USER:$NATIVE_USER" "$NATIVE_DIR" "$NATIVE_HOME"
+  mkdir -p "$NATIVE_HOME"
+  chown -R "$NATIVE_USER:$NATIVE_USER" "$NATIVE_HOME"
 }
 
-install_native_service_unit() {
-  tee "/etc/systemd/system/$NATIVE_SERVICE.service" >/dev/null <<EOF2
+make_native_service_file() {
+  cat > "/etc/systemd/system/${NATIVE_SERVICE}.service" <<EOF2
 [Unit]
 Description=Telemt
 After=network-online.target
@@ -173,10 +224,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=$NATIVE_USER
-Group=$NATIVE_USER
-WorkingDirectory=$NATIVE_HOME
-ExecStart=$NATIVE_BINARY $NATIVE_CONFIG
+User=${NATIVE_USER}
+Group=${NATIVE_USER}
+WorkingDirectory=${NATIVE_HOME}
+ExecStart=${NATIVE_BINARY} ${NATIVE_CONFIG}
 Restart=on-failure
 LimitNOFILE=65536
 AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -186,14 +237,92 @@ NoNewPrivileges=true
 [Install]
 WantedBy=multi-user.target
 EOF2
-  systemctl daemon-reload
 }
 
-write_base_telemt_config() {
+ensure_native_api_config() {
+  [ -f "$NATIVE_CONFIG" ] || return 0
+  python3 - "$NATIVE_CONFIG" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+text = p.read_text(errors='ignore')
+block = '''[server.api]
+enabled = true
+listen = "127.0.0.1:9091"
+whitelist = ["127.0.0.0/8"]
+'''
+lines = text.splitlines()
+out = []
+in_block = False
+seen = False
+for line in lines:
+    s = line.strip()
+    if s == '[server.api]':
+        if not seen:
+            out.extend(block.strip().splitlines())
+            seen = True
+        in_block = True
+        continue
+    if in_block and s.startswith('[') and s != '[server.api]':
+        in_block = False
+        out.append(line)
+        continue
+    if not in_block:
+        out.append(line)
+if not seen:
+    if out and out[-1].strip():
+        out.append('')
+    out.extend(block.strip().splitlines())
+p.write_text('\n'.join(out) + '\n')
+PY
+  chmod 600 "$NATIVE_CONFIG"
+  chown -R "$NATIVE_USER:$NATIVE_USER" "$NATIVE_DIR"
+}
+
+ensure_docker_api_config() {
   local cfg="$1"
-  local domain="$2"
-  local secret="$3"
-  cat > "$cfg" <<EOF2
+  [ -f "$cfg" ] || return 0
+  python3 - "$cfg" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+text = p.read_text(errors='ignore')
+block = '''[server.api]
+enabled = true
+listen = "0.0.0.0:9091"
+whitelist = ["127.0.0.0/8", "172.16.0.0/12"]
+'''
+lines = text.splitlines()
+out = []
+in_block = False
+seen = False
+for line in lines:
+    s = line.strip()
+    if s == '[server.api]':
+        if not seen:
+            out.extend(block.strip().splitlines())
+            seen = True
+        in_block = True
+        continue
+    if in_block and s.startswith('[') and s != '[server.api]':
+        in_block = False
+        out.append(line)
+        continue
+    if not in_block:
+        out.append(line)
+if not seen:
+    if out and out[-1].strip():
+        out.append('')
+    out.extend(block.strip().splitlines())
+p.write_text('\n'.join(out) + '\n')
+PY
+}
+
+write_basic_native_config() {
+  local domain="$1"
+  local secret="$2"
+  mkdir -p "$NATIVE_DIR"
+  cat > "$NATIVE_CONFIG" <<EOF2
 [general]
 use_middle_proxy = false
 
@@ -205,74 +334,41 @@ tls = true
 [server]
 port = 443
 
-[server.api]
-enabled = true
-listen = "127.0.0.1:9091"
-whitelist = ["127.0.0.1/32"]
-minimal_runtime_enabled = false
-minimal_runtime_cache_ttl_ms = 1000
-
 [censorship]
 tls_domain = "$domain"
-mask = true
-tls_emulation = true
-tls_front_dir = "tlsfront"
 
 [access.users]
 main_user = "$secret"
 EOF2
+  chmod 600 "$NATIVE_CONFIG"
+  ensure_native_api_config
+  ensure_native_user
+  chown -R "$NATIVE_USER:$NATIVE_USER" "$NATIVE_DIR"
 }
 
-patch_telemt_api() {
-  local cfg="$1"
-  local mode="$2"
-  python3 - "$cfg" "$mode" <<'PY'
-from pathlib import Path
-import sys
-cfg = Path(sys.argv[1])
-mode = sys.argv[2]
-text = cfg.read_text(encoding='utf-8', errors='ignore')
-if mode == 'native':
-    block = [
-        '[server.api]',
-        'enabled = true',
-        'listen = "127.0.0.1:9091"',
-        'whitelist = ["127.0.0.1/32"]',
-        'minimal_runtime_enabled = false',
-        'minimal_runtime_cache_ttl_ms = 1000',
-    ]
-else:
-    block = [
-        '[server.api]',
-        'enabled = true',
-        'listen = "0.0.0.0:9091"',
-        'whitelist = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]',
-        'minimal_runtime_enabled = false',
-        'minimal_runtime_cache_ttl_ms = 1000',
-    ]
-lines = text.splitlines()
-out = []
-in_api = False
-replaced = False
-for line in lines:
-    s = line.strip()
-    if s == '[server.api]':
-        if not replaced:
-            out.extend(block)
-            replaced = True
-        in_api = True
-        continue
-    if in_api:
-        if s.startswith('[') and s != '[server.api]':
-            in_api = False
-            out.append(line)
-        continue
-    out.append(line)
-if not replaced:
-    out.append('')
-    out.extend(block)
-cfg.write_text('\n'.join(out).rstrip() + '\n', encoding='utf-8')
-PY
+write_basic_docker_config() {
+  local domain="$1"
+  local secret="$2"
+  mkdir -p "$WORK_DIR"
+  cat > "$WORK_DIR/config.toml" <<EOF2
+[general]
+use_middle_proxy = false
+
+[general.modes]
+classic = false
+secure = false
+tls = true
+
+[server]
+port = 443
+
+[censorship]
+tls_domain = "$domain"
+
+[access.users]
+main_user = "$secret"
+EOF2
+  ensure_docker_api_config "$WORK_DIR/config.toml"
 }
 
 write_docker_compose() {
@@ -280,14 +376,12 @@ write_docker_compose() {
   cat > "$WORK_DIR/docker-compose.yml" <<EOF2
 services:
   telemt:
-    image: $DOCKER_IMAGE
-    build: .
-    container_name: $DOCKER_CONTAINER
+    image: ${DOCKER_IMAGE}
+    container_name: ${DOCKER_CONTAINER}
     restart: unless-stopped
     ports:
       - "443:443"
       - "127.0.0.1:9091:9091"
-      - "127.0.0.1:9090:9090"
     working_dir: /run/telemt
     volumes:
       - ./config.toml:/run/telemt/config.toml:ro
@@ -309,754 +403,438 @@ services:
 EOF2
 }
 
-stop_native_service() {
-  systemctl stop "$NATIVE_SERVICE" 2>/dev/null || true
-  systemctl disable "$NATIVE_SERVICE" 2>/dev/null || true
-}
-
-start_native_service() {
-  systemctl daemon-reload
-  systemctl enable --now "$NATIVE_SERVICE"
+compose() {
+  docker compose "$@"
 }
 
 start_docker_stack() {
   ensure_docker
   write_docker_compose
-  cd "$WORK_DIR" || exit 1
-  compose down --remove-orphans || true
+  cd "$WORK_DIR"
+  compose down --remove-orphans >/dev/null 2>&1 || true
   docker rm -f "$DOCKER_CONTAINER" >/dev/null 2>&1 || true
   compose up -d
 }
 
-stop_docker_stack() {
+stop_and_remove_docker_stack() {
   if [ -f "$WORK_DIR/docker-compose.yml" ]; then
-    (cd "$WORK_DIR" && compose down --remove-orphans) || true
+    cd "$WORK_DIR"
+    compose down --remove-orphans >/dev/null 2>&1 || true
   fi
   docker rm -f "$DOCKER_CONTAINER" >/dev/null 2>&1 || true
 }
 
-install_panel_binary() {
+build_native_binary() {
+  local branch_mode="$1"
+  ensure_rust
+  clone_telemt_source "$branch_mode"
+  cargo build --release
+  install -m 0755 target/release/telemt "$NATIVE_BINARY"
+}
+
+build_docker_image() {
+  local branch_mode="$1"
+  ensure_docker
+  clone_telemt_source "$branch_mode"
+  docker build -t "$DOCKER_IMAGE" .
+}
+
+pull_docker_image() {
+  ensure_docker
+  docker pull "$DOCKER_IMAGE"
+}
+
+install_or_update_panel_binary() {
   install_base_deps
-  local arch latest tarball binary_name tmpdir
-  arch="$(uname -m)"
-  case "$arch" in
-    x86_64|aarch64) ;;
-    *) die "Неподдерживаемая архитектура для telemt-panel: $arch" ;;
-  esac
-  latest="$(curl -fsSL https://api.github.com/repos/amirotin/telemt_panel/releases/latest | python3 -c 'import sys,json; print(json.load(sys.stdin)["tag_name"])')"
-  [ -n "$latest" ] || die "Не удалось определить последний релиз telemt-panel"
-  tarball="telemt-panel-$arch-linux-gnu.tar.gz"
-  binary_name="telemt-panel-$arch-linux"
-  tmpdir="$(mktemp -d)"
-  curl -fsSL "https://github.com/amirotin/telemt_panel/releases/download/$latest/$tarball" -o "$tmpdir/$tarball"
-  tar -xzf "$tmpdir/$tarball" -C "$tmpdir"
-  install -m 0755 "$tmpdir/$binary_name" "$PANEL_BINARY"
-  rm -rf "$tmpdir"
-}
-
-ensure_panel_service_unit() {
-  mkdir -p "$PANEL_DIR"
-  tee "/etc/systemd/system/$PANEL_SERVICE.service" >/dev/null <<EOF2
-[Unit]
-Description=Telemt Panel
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=$PANEL_BINARY --config $PANEL_CONFIG
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=65536
-
-[Install]
-WantedBy=multi-user.target
-EOF2
-  systemctl daemon-reload
-}
-
-create_panel_config_if_missing() {
-  local telemt_auth="$1"
-  if [ -f "$PANEL_CONFIG" ]; then
-    return 0
-  fi
-  local admin_user admin_pass admin_pass2 pass_hash jwt_secret
-  admin_user="$(ask 'Логин администратора панели' 'admin')"
-  while true; do
-    admin_pass="$(ask_secret 'Пароль администратора панели')"
-    admin_pass2="$(ask_secret 'Повторите пароль администратора панели')"
-    [ "$admin_pass" = "$admin_pass2" ] && break
-    warn "Пароли не совпадают, попробуйте ещё раз"
-  done
-  pass_hash="$(printf '%s' "$admin_pass" | "$PANEL_BINARY" hash-password)"
-  jwt_secret="$(openssl rand -hex 32)"
-  mkdir -p "$PANEL_DIR"
-  cat > "$PANEL_CONFIG" <<EOF2
-listen = "0.0.0.0:8080"
-
-[telemt]
-url = "http://127.0.0.1:9091"
-auth_header = "$telemt_auth"
-
-[panel]
-binary_path = "$PANEL_BINARY"
-service_name = "$PANEL_SERVICE"
-
-[auth]
-username = "$admin_user"
-password_hash = "$pass_hash"
-jwt_secret = "$jwt_secret"
-session_ttl = "24h"
-EOF2
-  chmod 600 "$PANEL_CONFIG"
+  say "🧩 Устанавливаем / обновляем Telemt Panel"
+  curl -fsSL https://raw.githubusercontent.com/amirotin/telemt_panel/main/install.sh | bash
 }
 
 sync_panel_config() {
   local mode="$1"
-  local auth_override="${2-__KEEP__}"
-  require_file "$PANEL_CONFIG"
-  python3 - "$PANEL_CONFIG" "$mode" "$auth_override" "$NATIVE_BINARY" "$NATIVE_SERVICE" "$PANEL_BINARY" "$PANEL_SERVICE" <<'PY'
+  [ -f "$PANEL_CONFIG" ] || return 0
+  local telemt_url="http://127.0.0.1:9091"
+  if [ "$mode" = "docker" ]; then
+    telemt_url="http://127.0.0.1:9091"
+  fi
+  python3 - "$PANEL_CONFIG" "$telemt_url" <<'PY'
 from pathlib import Path
 import sys
 cfg = Path(sys.argv[1])
-mode = sys.argv[2]
-auth_override = sys.argv[3]
-native_binary = sys.argv[4]
-native_service = sys.argv[5]
-panel_binary = sys.argv[6]
-panel_service = sys.argv[7]
-text = cfg.read_text(encoding='utf-8', errors='ignore')
+telemt_url = sys.argv[2]
+text = cfg.read_text(errors='ignore')
+if '[telemt]' not in text:
+    if text and not text.endswith('\n'):
+        text += '\n'
+    text += '\n[telemt]\n'
 lines = text.splitlines()
-
-current_auth = ''
-in_telemt = False
-for line in lines:
-    s = line.strip()
-    if s == '[telemt]':
-        in_telemt = True
-        continue
-    if in_telemt and s.startswith('[') and s != '[telemt]':
-        in_telemt = False
-    if in_telemt and s.startswith('auth_header ='):
-        current_auth = s.split('=', 1)[1].strip().strip('"')
-        break
-new_auth = current_auth if auth_override == '__KEEP__' else auth_override
-
 out = []
-in_telemt = False
-in_panel = False
-saw_telemt = saw_panel = False
-telemt_url_done = telemt_auth_done = False
-telemt_bin_done = telemt_srv_done = False
-panel_bin_done = panel_srv_done = False
-
+in_block = False
+seen_url = seen_auth = seen_bin = seen_srv = False
 for line in lines:
     s = line.strip()
-
     if s == '[telemt]':
-        saw_telemt = True
-        in_telemt = True
-        in_panel = False
+        in_block = True
         out.append(line)
         continue
-
-    if s == '[panel]':
-        saw_panel = True
-        in_panel = True
-        in_telemt = False
+    if in_block and s.startswith('[') and s != '[telemt]':
+        if not seen_url:
+            out.append(f'url = "{telemt_url}"')
+        if not seen_auth:
+            out.append('auth_header = ""')
+        if not seen_bin:
+            out.append('binary_path = "/bin/telemt"')
+        if not seen_srv:
+            out.append('service_name = "telemt"')
+        in_block = False
         out.append(line)
         continue
-
-    if in_telemt and s.startswith('[') and s != '[telemt]':
-        if not telemt_url_done:
-            out.append('url = "http://127.0.0.1:9091"')
-        if not telemt_auth_done:
-            out.append(f'auth_header = "{new_auth}"')
-        if mode == 'native':
-            if not telemt_bin_done:
-                out.append(f'binary_path = "{native_binary}"')
-            if not telemt_srv_done:
-                out.append(f'service_name = "{native_service}"')
-        in_telemt = False
-        out.append(line)
+    if in_block and s.startswith('url ='):
+        out.append(f'url = "{telemt_url}"')
+        seen_url = True
         continue
-
-    if in_panel and s.startswith('[') and s != '[panel]':
-        if not panel_bin_done:
-            out.append(f'binary_path = "{panel_binary}"')
-        if not panel_srv_done:
-            out.append(f'service_name = "{panel_service}"')
-        in_panel = False
-        out.append(line)
+    if in_block and s.startswith('auth_header ='):
+        out.append('auth_header = ""')
+        seen_auth = True
         continue
-
-    if in_telemt:
-        if s.startswith('url ='):
-            out.append('url = "http://127.0.0.1:9091"')
-            telemt_url_done = True
-            continue
-        if s.startswith('auth_header ='):
-            out.append(f'auth_header = "{new_auth}"')
-            telemt_auth_done = True
-            continue
-        if s.startswith('binary_path ='):
-            if mode == 'native':
-                out.append(f'binary_path = "{native_binary}"')
-                telemt_bin_done = True
-            continue
-        if s.startswith('service_name ='):
-            if mode == 'native':
-                out.append(f'service_name = "{native_service}"')
-                telemt_srv_done = True
-            continue
-        out.append(line)
+    if in_block and s.startswith('binary_path ='):
+        out.append('binary_path = "/bin/telemt"')
+        seen_bin = True
         continue
-
-    if in_panel:
-        if s.startswith('binary_path ='):
-            out.append(f'binary_path = "{panel_binary}"')
-            panel_bin_done = True
-            continue
-        if s.startswith('service_name ='):
-            out.append(f'service_name = "{panel_service}"')
-            panel_srv_done = True
-            continue
-        out.append(line)
+    if in_block and s.startswith('service_name ='):
+        out.append('service_name = "telemt"')
+        seen_srv = True
         continue
-
     out.append(line)
-
-if in_telemt:
-    if not telemt_url_done:
-        out.append('url = "http://127.0.0.1:9091"')
-    if not telemt_auth_done:
-        out.append(f'auth_header = "{new_auth}"')
-    if mode == 'native':
-        if not telemt_bin_done:
-            out.append(f'binary_path = "{native_binary}"')
-        if not telemt_srv_done:
-            out.append(f'service_name = "{native_service}"')
-
-if in_panel:
-    if not panel_bin_done:
-        out.append(f'binary_path = "{panel_binary}"')
-    if not panel_srv_done:
-        out.append(f'service_name = "{panel_service}"')
-
-if not saw_telemt:
-    out.extend(['', '[telemt]', 'url = "http://127.0.0.1:9091"', f'auth_header = "{new_auth}"'])
-    if mode == 'native':
-        out.append(f'binary_path = "{native_binary}"')
-        out.append(f'service_name = "{native_service}"')
-
-if not saw_panel:
-    out.extend(['', '[panel]', f'binary_path = "{panel_binary}"', f'service_name = "{panel_service}"'])
-
-cfg.write_text('\n'.join(out).rstrip() + '\n', encoding='utf-8')
+if in_block:
+    if not seen_url:
+        out.append(f'url = "{telemt_url}"')
+    if not seen_auth:
+        out.append('auth_header = ""')
+    if not seen_bin:
+        out.append('binary_path = "/bin/telemt"')
+    if not seen_srv:
+        out.append('service_name = "telemt"')
+cfg.write_text('\n'.join(out) + '\n')
 PY
   chmod 600 "$PANEL_CONFIG"
 }
 
-first_user_secret() {
-  local cfg="$1"
-  python3 - "$cfg" <<'PY'
-import re, sys
-from pathlib import Path
-text = Path(sys.argv[1]).read_text(encoding='utf-8', errors='ignore')
-m = re.search(r'^\s*\[access\.users\]\s*$', text, flags=re.M)
-if not m:
-    raise SystemExit(0)
-rest = text[m.end():]
-for line in rest.splitlines():
-    s = line.strip()
-    if not s or s.startswith('#'):
-        continue
-    if s.startswith('['):
-        break
-    m2 = re.match(r'^\s*"?([A-Za-z0-9_.-]+)"?\s*=\s*"([0-9a-fA-F]{32})"\s*$', line)
-    if m2:
-        print(m2.group(2))
-        break
-PY
-}
-
-tls_domain_from_cfg() {
-  local cfg="$1"
-  python3 - "$cfg" <<'PY'
-import re, sys
-from pathlib import Path
-text = Path(sys.argv[1]).read_text(encoding='utf-8', errors='ignore')
-m = re.search(r'^\s*tls_domain\s*=\s*"([^"]+)"\s*$', text, flags=re.M)
-if m:
-    print(m.group(1))
-PY
-}
-
-wait_for_port() {
-  local port="$1"
-  local tries="${2:-20}"
-  local i
-  for i in $(seq 1 "$tries"); do
-    if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE ":$port$"; then
-      return 0
-    fi
-    sleep 1
-  done
-  return 1
-}
-
-is_native_present() {
-  [ -f "$NATIVE_CONFIG" ] || [ -f "/etc/systemd/system/$NATIVE_SERVICE.service" ] || [ -x "$NATIVE_BINARY" ]
-}
-
-is_native_running() {
-  systemctl is-active --quiet "$NATIVE_SERVICE" 2>/dev/null
-}
-
-is_docker_present() {
-  [ -f "$WORK_DIR/docker-compose.yml" ] || docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$DOCKER_CONTAINER"
-}
-
-is_docker_running() {
-  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$DOCKER_CONTAINER"
-}
-
-is_panel_present() {
-  [ -x "$PANEL_BINARY" ] || [ -f "$PANEL_CONFIG" ] || [ -f "/etc/systemd/system/$PANEL_SERVICE.service" ]
-}
-
-is_panel_running() {
-  systemctl is-active --quiet "$PANEL_SERVICE" 2>/dev/null
-}
-
-detect_mode() {
-  if is_docker_running; then
-    printf 'docker'
-  elif is_native_running; then
-    printf 'native'
-  elif is_docker_present && is_native_present; then
-    printf 'both'
-  elif is_docker_present; then
-    printf 'docker'
-  elif is_native_present; then
-    printf 'native'
-  else
-    printf 'none'
-  fi
-}
-
-choose_existing_mode() {
-  local mode
-  mode="$(detect_mode)"
-  case "$mode" in
-    native|docker)
-      printf '%s' "$mode"
-      ;;
-    both)
-      say 'Обнаружены и служба, и Docker-артефакты.'
-      say '  1) Служба'
-      say '  2) Docker'
-      case "$(ask_menu 'Выберите (1-2)')" in
-        1) printf 'native' ;;
-        2) printf 'docker' ;;
-        *) die 'Неверный выбор' ;;
-      esac
-      ;;
-    none)
-      die 'Telemt не найден' ;;
-  esac
-}
-
-print_links() {
-  local cfg mode domain secret ip hex hostip
-  mode="$(detect_mode)"
-  if [ "$mode" = 'docker' ] && [ -f "$WORK_DIR/config.toml" ]; then
-    cfg="$WORK_DIR/config.toml"
-  elif [ -f "$NATIVE_CONFIG" ]; then
-    cfg="$NATIVE_CONFIG"
-  elif [ -f "$WORK_DIR/config.toml" ]; then
-    cfg="$WORK_DIR/config.toml"
-  else
-    warn 'Не удалось определить конфиг Telemt для ссылок'
-    return 0
-  fi
-  domain="$(tls_domain_from_cfg "$cfg")"
-  secret="$(first_user_secret "$cfg")"
-  ip="$(curl -fsS --max-time 10 -4 ifconfig.me 2>/dev/null || true)"
-  hostip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  say '═════════════════════════════════════════════════════'
-  if [ -n "$domain" ] && [ -n "$secret" ] && [ -n "$ip" ]; then
-    hex="$(printf '%s' "$domain" | od -An -tx1 -v | tr -d ' \n')"
-    say "🔗 TELEGRAM: tg://proxy?server=$ip&port=443&secret=ee${secret}${hex}"
-  else
-    say '🔗 TELEGRAM: не удалось собрать автоматически'
-  fi
-  if is_panel_present; then
-    say "🌐 ПАНЕЛЬ:   http://${hostip:-<IP_СЕРВЕРА>}:8080"
-  fi
-  say '═════════════════════════════════════════════════════'
-}
-
-show_status_and_links() {
-  local mode
-  mode="$(detect_mode)"
-  say '═════════════════════════════════════════════════════'
-  say 'Статус Telemt'
-  say '═════════════════════════════════════════════════════'
-  case "$mode" in
-    native) say 'Режим: Служба' ;;
-    docker) say 'Режим: Docker' ;;
-    both) say 'Режим: Обнаружены и служба, и Docker-артефакты' ;;
-    none) say 'Режим: Telemt не найден' ;;
-  esac
-  say "Служба telemt:       $(systemctl is-active "$NATIVE_SERVICE" 2>/dev/null || echo inactive)"
-  say "Панель telemt-panel: $(systemctl is-active "$PANEL_SERVICE" 2>/dev/null || echo inactive)"
-  if is_docker_present; then
-    say 'Docker контейнер:'
-    docker ps -a --filter "name=^/${DOCKER_CONTAINER}$" --format '  {{.Names}}  {{.Status}}  {{.Ports}}' || true
-  fi
-  print_links
+ensure_panel_for_mode() {
+  local mode="$1"
+  install_or_update_panel_binary
+  sync_panel_config "$mode"
+  systemctl daemon-reload
+  systemctl enable "$PANEL_SERVICE" >/dev/null 2>&1 || true
+  systemctl restart "$PANEL_SERVICE"
 }
 
 auto_cleanup() {
-  say '🧹 Авто-очистка мусора...'
+  say "🧹 Автоочистка мусора"
   rm -rf "$BUILD_DIR" 2>/dev/null || true
-  docker builder prune -f >/dev/null 2>&1 || true
-  docker image prune -f >/dev/null 2>&1 || true
-}
-
-safe_cleanup_only() {
-  auto_cleanup
-  say '✅ Очистка завершена'
-}
-
-start_or_restart_backend_for_mode() {
-  local mode="$1"
-  if [ "$mode" = 'native' ]; then
-    require_file "$NATIVE_CONFIG"
-    patch_telemt_api "$NATIVE_CONFIG" native
-    chown "$NATIVE_USER:$NATIVE_USER" "$NATIVE_CONFIG" 2>/dev/null || true
-    chmod 640 "$NATIVE_CONFIG" 2>/dev/null || chmod 600 "$NATIVE_CONFIG"
-    install_native_service_unit
-    start_native_service
-  else
-    require_file "$WORK_DIR/config.toml"
-    patch_telemt_api "$WORK_DIR/config.toml" docker
-    start_docker_stack
+  if command -v docker >/dev/null 2>&1; then
+    docker image prune -f >/dev/null 2>&1 || true
+    docker builder prune -f >/dev/null 2>&1 || true
   fi
-  wait_for_port 9091 20 || warn 'Порт 9091 не начал слушаться вовремя'
 }
 
-install_or_update_panel_for_mode() {
-  local mode="$1"
-  local telemt_auth="$2"
-  install_panel_binary
-  ensure_panel_service_unit
-  create_panel_config_if_missing "$telemt_auth"
-  sync_panel_config "$mode" "$telemt_auth"
-  systemctl enable --now "$PANEL_SERVICE"
-}
-
-repair_panel_flow() {
-  local mode telemt_auth
-  mode="$(choose_existing_mode)"
-  start_or_restart_backend_for_mode "$mode"
-  telemt_auth="$(ask 'Telemt API auth header для панели (Enter = оставить как есть / пустым)' '')"
-  if [ -f "$PANEL_CONFIG" ] && [ -z "$telemt_auth" ]; then
-    install_or_update_panel_for_mode "$mode" "$(python3 - "$PANEL_CONFIG" <<'PY'
-from pathlib import Path
-import re, sys
-p=Path(sys.argv[1])
-text=p.read_text(encoding='utf-8', errors='ignore') if p.exists() else ''
-m=re.search(r'(?ms)^\[telemt\].*?^auth_header\s*=\s*"([^"]*)"', text)
-print(m.group(1) if m else '')
-PY
-)"
-  else
-    install_or_update_panel_for_mode "$mode" "$telemt_auth"
+show_links() {
+  local cfg=""
+  if docker_installed && [ -f "$WORK_DIR/config.toml" ]; then
+    cfg="$WORK_DIR/config.toml"
+  elif [ -f "$NATIVE_CONFIG" ]; then
+    cfg="$NATIVE_CONFIG"
   fi
-  if [ "$mode" = 'docker' ]; then
-    warn 'В Docker-режиме панель подходит для управления API и мониторинга. Обновлять сам Telemt лучше через этот скрипт.'
+
+  local domain="" secret="" ip=""
+  if [ -n "$cfg" ]; then
+    domain=$(read_cfg_value "$cfg" "tls_domain")
+    secret=$(read_cfg_value "$cfg" "main_user")
   fi
-  auto_cleanup
-  print_links
+  ip=$(current_external_ip)
+
+  say "═════════════════════════════════════════════════════"
+  say "Статус Telemt: $(active_mode)"
+  say "Service: $(native_running && printf 'active' || printf 'inactive')"
+  say "Docker: $(docker_running && printf 'running' || printf 'stopped')"
+  say "Panel:  $(panel_running && printf 'active' || printf 'inactive')"
+  if [ -n "$domain" ] && [ -n "$secret" ] && [ -n "$ip" ]; then
+    say "🔗 TELEGRAM: tg://proxy?server=${ip}&port=443&secret=ee${secret}$(hex_domain "$domain")"
+  fi
+  if [ -n "$ip" ]; then
+    say "🌐 PANEL:   http://${ip}:8080"
+  fi
+  if [ -n "$cfg" ]; then
+    say "📄 CONFIG:  ${cfg}"
+  fi
+  say "═════════════════════════════════════════════════════"
 }
 
-install_new_native() {
+install_new_service() {
   local with_panel="$1"
-  local channel domain secret telemt_auth
-  channel="$(choose_source_channel)"
-  domain="$(ask 'Домен маскировки' 'google.com')"
-  secret="$(ask 'Секрет Telemt (32 hex, Enter = сгенерировать автоматически)' '')"
-  [ -n "$secret" ] || secret="$(openssl rand -hex 16)"
+  local branch_mode domain secret
+  branch_mode=$(choose_branch_mode)
+  domain=$(ask "Домен маскировки" "google.com")
+  secret=$(openssl rand -hex 16)
 
-  ensure_native_layout
-  build_native_binary "$channel"
-  mkdir -p /tmp/telemt-install
-  write_base_telemt_config /tmp/telemt-install/telemt.toml "$domain" "$secret"
-  patch_telemt_api /tmp/telemt-install/telemt.toml native
-  mv /tmp/telemt-install/telemt.toml "$NATIVE_CONFIG"
-  chown "$NATIVE_USER:$NATIVE_USER" "$NATIVE_CONFIG"
-  chmod 640 "$NATIVE_CONFIG"
-  install_native_service_unit
-  start_native_service
-  wait_for_port 9091 20 || warn 'Порт 9091 не начал слушаться вовремя'
+  stop_and_remove_docker_stack
 
-  if [ "$with_panel" = 'yes' ]; then
-    telemt_auth="$(ask 'Telemt API auth header для панели (если не используется — оставьте пустым)' '')"
-    install_or_update_panel_for_mode native "$telemt_auth"
+  install_base_deps
+  build_native_binary "$branch_mode"
+  ensure_native_user
+  write_basic_native_config "$domain" "$secret"
+  make_native_service_file
+  systemctl daemon-reload
+  systemctl enable --now "$NATIVE_SERVICE"
+
+  if [ "$with_panel" = "yes" ]; then
+    ensure_panel_for_mode service
   fi
-
   auto_cleanup
-  print_links
+  show_links
 }
 
 install_new_docker() {
-  local method="$1"
-  local with_panel="$2"
-  local channel domain secret telemt_auth
+  local with_panel="$1"
+  local source_mode domain secret branch_mode="stable"
+  source_mode=$(choose_docker_source)
+  if [ "$source_mode" = "build" ]; then
+    branch_mode=$(choose_branch_mode)
+  fi
+  domain=$(ask "Домен маскировки" "google.com")
+  secret=$(openssl rand -hex 16)
+
+  systemctl stop "$NATIVE_SERVICE" >/dev/null 2>&1 || true
+  systemctl disable "$NATIVE_SERVICE" >/dev/null 2>&1 || true
+
   install_base_deps
-  ensure_docker
-  domain="$(ask 'Домен маскировки' 'google.com')"
-  secret="$(ask 'Секрет Telemt (32 hex, Enter = сгенерировать автоматически)' '')"
-  [ -n "$secret" ] || secret="$(openssl rand -hex 16)"
-
-  mkdir -p "$WORK_DIR"
-  write_base_telemt_config "$WORK_DIR/config.toml" "$domain" "$secret"
-  patch_telemt_api "$WORK_DIR/config.toml" docker
-  write_docker_compose
-
-  if [ "$method" = 'build' ]; then
-    channel="$(choose_source_channel)"
-    build_docker_image "$channel"
+  write_basic_docker_config "$domain" "$secret"
+  if [ "$source_mode" = "pull" ]; then
+    pull_docker_image
   else
-    docker pull "$DOCKER_IMAGE"
-  fi
-
-  start_docker_stack
-  wait_for_port 9091 20 || warn 'Порт 9091 не начал слушаться вовремя'
-
-  if [ "$with_panel" = 'yes' ]; then
-    telemt_auth="$(ask 'Telemt API auth header для панели (если не используется — оставьте пустым)' '')"
-    install_or_update_panel_for_mode docker "$telemt_auth"
-    warn 'В Docker-режиме обновлять Telemt через веб-панель не стоит — используйте этот скрипт.'
-  fi
-
-  auto_cleanup
-  print_links
-}
-
-update_native() {
-  local channel
-  require_file "$NATIVE_CONFIG"
-  ensure_native_layout
-  channel="$(choose_source_channel)"
-  build_native_binary "$channel"
-  patch_telemt_api "$NATIVE_CONFIG" native
-  chown "$NATIVE_USER:$NATIVE_USER" "$NATIVE_CONFIG" 2>/dev/null || true
-  chmod 640 "$NATIVE_CONFIG" 2>/dev/null || chmod 600 "$NATIVE_CONFIG"
-  install_native_service_unit
-  start_native_service
-  if is_panel_present; then
-    sync_panel_config native
-    systemctl restart "$PANEL_SERVICE" || true
-  fi
-  auto_cleanup
-  print_links
-}
-
-update_docker() {
-  local method="$1"
-  local channel
-  require_file "$WORK_DIR/config.toml"
-  install_base_deps
-  ensure_docker
-  patch_telemt_api "$WORK_DIR/config.toml" docker
-  write_docker_compose
-  if [ "$method" = 'build' ]; then
-    channel="$(choose_source_channel)"
-    build_docker_image "$channel"
-  else
-    docker pull "$DOCKER_IMAGE"
+    build_docker_image "$branch_mode"
   fi
   start_docker_stack
-  if is_panel_present; then
-    sync_panel_config docker
-    systemctl restart "$PANEL_SERVICE" || true
+
+  if [ "$with_panel" = "yes" ]; then
+    ensure_panel_for_mode docker
   fi
   auto_cleanup
-  print_links
+  show_links
 }
 
-migrate_native_to_docker() {
-  local method="$1"
-  local channel
-  require_file "$NATIVE_CONFIG"
+update_existing_telemt() {
+  local mode
+  mode=$(active_mode)
+  case "$mode" in
+    service|service-stopped)
+      local branch_mode
+      branch_mode=$(choose_branch_mode)
+      install_base_deps
+      build_native_binary "$branch_mode"
+      [ -f "$NATIVE_CONFIG" ] || die "Не найден $NATIVE_CONFIG"
+      ensure_native_api_config
+      make_native_service_file
+      systemctl daemon-reload
+      systemctl enable "$NATIVE_SERVICE" >/dev/null 2>&1 || true
+      systemctl restart "$NATIVE_SERVICE"
+      if panel_installed; then
+        sync_panel_config service
+        systemctl restart "$PANEL_SERVICE" >/dev/null 2>&1 || true
+      fi
+      auto_cleanup
+      show_links
+      ;;
+    docker|docker-stopped)
+      local source_mode branch_mode="stable"
+      source_mode=$(choose_docker_source)
+      install_base_deps
+      [ -f "$WORK_DIR/config.toml" ] || die "Не найден $WORK_DIR/config.toml"
+      ensure_docker_api_config "$WORK_DIR/config.toml"
+      if [ "$source_mode" = "pull" ]; then
+        pull_docker_image
+      else
+        branch_mode=$(choose_branch_mode)
+        build_docker_image "$branch_mode"
+      fi
+      start_docker_stack
+      if panel_installed; then
+        sync_panel_config docker
+        systemctl restart "$PANEL_SERVICE" >/dev/null 2>&1 || true
+      fi
+      auto_cleanup
+      show_links
+      ;;
+    *)
+      die "Telemt не найден ни как служба, ни как Docker-контейнер"
+      ;;
+  esac
+}
+
+repair_or_update_panel() {
+  local mode
+  mode=$(active_mode)
+  case "$mode" in
+    service|service-stopped)
+      ensure_native_api_config
+      systemctl enable "$NATIVE_SERVICE" >/dev/null 2>&1 || true
+      systemctl restart "$NATIVE_SERVICE" >/dev/null 2>&1 || true
+      ensure_panel_for_mode service
+      auto_cleanup
+      show_links
+      ;;
+    docker|docker-stopped)
+      [ -f "$WORK_DIR/config.toml" ] || die "Не найден $WORK_DIR/config.toml"
+      ensure_docker_api_config "$WORK_DIR/config.toml"
+      start_docker_stack
+      ensure_panel_for_mode docker
+      auto_cleanup
+      show_links
+      ;;
+    none)
+      die "Сначала установите Telemt как службу или Docker-контейнер"
+      ;;
+  esac
+}
+
+migrate_service_to_docker() {
+  native_installed || die "Служба Telemt не найдена"
+  [ -f "$NATIVE_CONFIG" ] || die "Не найден $NATIVE_CONFIG"
+
   install_base_deps
-  ensure_docker
   mkdir -p "$WORK_DIR"
   cp "$NATIVE_CONFIG" "$WORK_DIR/config.toml"
-  chmod 644 "$WORK_DIR/config.toml" 2>/dev/null || true
-  patch_telemt_api "$WORK_DIR/config.toml" docker
-  write_docker_compose
-  stop_native_service
-  if [ "$method" = 'build' ]; then
-    channel="$(choose_source_channel)"
-    build_docker_image "$channel"
+  ensure_docker_api_config "$WORK_DIR/config.toml"
+
+  local source_mode branch_mode="stable"
+  source_mode=$(choose_docker_source)
+  if [ "$source_mode" = "pull" ]; then
+    pull_docker_image
   else
-    docker pull "$DOCKER_IMAGE"
+    branch_mode=$(choose_branch_mode)
+    build_docker_image "$branch_mode"
   fi
+
+  systemctl stop "$NATIVE_SERVICE" >/dev/null 2>&1 || true
+  systemctl disable "$NATIVE_SERVICE" >/dev/null 2>&1 || true
+  rm -f "/etc/systemd/system/${NATIVE_SERVICE}.service"
+  systemctl daemon-reload
+
   start_docker_stack
-  if is_panel_present; then
+  if panel_installed; then
     sync_panel_config docker
-    systemctl restart "$PANEL_SERVICE" || true
+    systemctl restart "$PANEL_SERVICE" >/dev/null 2>&1 || true
   fi
   auto_cleanup
-  print_links
+  show_links
 }
 
-migrate_docker_to_native() {
-  local channel
-  require_file "$WORK_DIR/config.toml"
-  ensure_native_layout
-  stop_docker_stack
-  channel="$(choose_source_channel)"
-  build_native_binary "$channel"
+migrate_docker_to_service() {
+  docker_installed || die "Docker-версия Telemt не найдена"
+  [ -f "$WORK_DIR/config.toml" ] || die "Не найден $WORK_DIR/config.toml"
+
+  install_base_deps
+  local branch_mode
+  branch_mode=$(choose_branch_mode)
+  build_native_binary "$branch_mode"
+  ensure_native_user
+  mkdir -p "$NATIVE_DIR"
   cp "$WORK_DIR/config.toml" "$NATIVE_CONFIG"
-  patch_telemt_api "$NATIVE_CONFIG" native
-  chown "$NATIVE_USER:$NATIVE_USER" "$NATIVE_CONFIG"
-  chmod 640 "$NATIVE_CONFIG"
-  install_native_service_unit
-  start_native_service
-  if is_panel_present; then
-    sync_panel_config native
-    systemctl restart "$PANEL_SERVICE" || true
+  ensure_native_api_config
+  chown -R "$NATIVE_USER:$NATIVE_USER" "$NATIVE_DIR"
+  chmod 600 "$NATIVE_CONFIG"
+  make_native_service_file
+
+  stop_and_remove_docker_stack
+
+  systemctl daemon-reload
+  systemctl enable --now "$NATIVE_SERVICE"
+
+  if panel_installed; then
+    sync_panel_config service
+    systemctl restart "$PANEL_SERVICE" >/dev/null 2>&1 || true
   fi
   auto_cleanup
-  print_links
+  show_links
 }
 
-update_existing_menu() {
-  local mode
-  mode="$(choose_existing_mode)"
-  case "$mode" in
-    native)
-      say 'Обнаружен режим: служба'
-      say '  1) Обновить службу (сборка из исходников)'
-      case "$(ask_menu 'Выберите (1)')" in
-        1) update_native ;;
-        *) die 'Неверный выбор' ;;
-      esac
-      ;;
-    docker)
-      say 'Обнаружен режим: Docker'
-      say '  1) Обновить Docker (docker pull)'
-      say '  2) Обновить Docker (сборка из исходников)'
-      case "$(ask_menu 'Выберите (1-2)')" in
-        1) update_docker pull ;;
-        2) update_docker build ;;
-        *) die 'Неверный выбор' ;;
-      esac
-      ;;
-  esac
-}
+remove_everything() {
+  local confirm
+  confirm=$(ask "Подтвердите полное удаление (yes/no)" "no")
+  [ "$confirm" = "yes" ] || { say "Отменено"; return 0; }
 
-new_install_menu() {
-  if [ "$(detect_mode)" != 'none' ]; then
-    warn 'Обнаружен уже существующий Telemt. Новая установка может перезаписать текущий режим.'
-    ask_confirm 'Продолжить новую установку' || return 0
-  fi
-  say 'Новая установка:'
-  say '  1) Служба + панель'
-  say '  2) Только служба'
-  say '  3) Docker (docker pull) + панель'
-  say '  4) Docker (сборка из исходников) + панель'
-  say '  5) Docker (docker pull) без панели'
-  say '  6) Docker (сборка из исходников) без панели'
-  case "$(ask_menu 'Выберите (1-6)')" in
-    1) install_new_native yes ;;
-    2) install_new_native no ;;
-    3) install_new_docker pull yes ;;
-    4) install_new_docker build yes ;;
-    5) install_new_docker pull no ;;
-    6) install_new_docker build no ;;
-    *) die 'Неверный выбор' ;;
-  esac
-}
+  stop_and_remove_docker_stack
+  docker rmi "$DOCKER_IMAGE" >/dev/null 2>&1 || true
 
-remove_all() {
-  ask_confirm 'Подтвердите полное удаление Telemt, панели, контейнера, бинарников и конфигов' || {
-    say 'Удаление отменено'
-    return 0
-  }
-  stop_docker_stack
-  docker image rm "$DOCKER_IMAGE" >/dev/null 2>&1 || true
-  systemctl stop "$PANEL_SERVICE" 2>/dev/null || true
-  systemctl disable "$PANEL_SERVICE" 2>/dev/null || true
-  rm -f "/etc/systemd/system/$PANEL_SERVICE.service"
+  systemctl stop "$PANEL_SERVICE" >/dev/null 2>&1 || true
+  systemctl disable "$PANEL_SERVICE" >/dev/null 2>&1 || true
+  rm -f "/etc/systemd/system/${PANEL_SERVICE}.service"
   rm -rf "$PANEL_DIR"
   rm -f "$PANEL_BINARY"
-  stop_native_service
-  rm -f "/etc/systemd/system/$NATIVE_SERVICE.service"
-  rm -rf "$NATIVE_DIR" "$NATIVE_HOME"
+
+  systemctl stop "$NATIVE_SERVICE" >/dev/null 2>&1 || true
+  systemctl disable "$NATIVE_SERVICE" >/dev/null 2>&1 || true
+  rm -f "/etc/systemd/system/${NATIVE_SERVICE}.service"
+  rm -rf "$NATIVE_DIR"
   rm -f "$NATIVE_BINARY"
-  if id "$NATIVE_USER" >/dev/null 2>&1; then
-    userdel -r "$NATIVE_USER" >/dev/null 2>&1 || true
-  fi
+  userdel -r "$NATIVE_USER" >/dev/null 2>&1 || true
+
   rm -rf "$WORK_DIR"
   systemctl daemon-reload
   auto_cleanup
-  say '✅ Всё, что связано с Telemt и telemt-panel, удалено'
+  say "✅ Всё, что связано с Telemt, удалено"
 }
 
-show_main_menu() {
-  clear
-  say '═════════════════════════════════════════════════════'
-  say ' 🛠️  Telemt Manager'
-  say '═════════════════════════════════════════════════════'
-  say '1) Новая установка'
-  say '2) Установить / обновить / починить панель'
-  say '3) Обновить существующий Telemt'
-  say '4) Миграция service → Docker'
-  say '5) Миграция Docker → service'
-  say '6) Показать статус и ссылки'
-  say '7) Удалить всё, что связано с Telemt'
-  say '8) Очистить мусор (ключи/ссылки не удаляются)'
-  say '0) Выход'
+safe_cleanup() {
+  auto_cleanup
+  say "✅ Мусор очищен. Конфиги, ключи и ссылки сохранены"
 }
 
-main() {
-  install_base_deps
-  show_main_menu
-  case "$(ask_menu 'Выберите пункт [0-8]')" in
-    1) new_install_menu ;;
-    2) repair_panel_flow ;;
-    3) update_existing_menu ;;
-    4)
-      case "$(choose_existing_mode)" in
-        native)
-          say '  1) Docker (docker pull)'
-          say '  2) Docker (сборка из исходников)'
-          case "$(ask_menu 'Выберите (1-2)')" in
-            1) migrate_native_to_docker pull ;;
-            2) migrate_native_to_docker build ;;
-            *) die 'Неверный выбор' ;;
-          esac
-          ;;
-        docker) die 'Сейчас активен Docker. Для этого режима используйте пункт 5.' ;;
-      esac
-      ;;
-    5)
-      case "$(choose_existing_mode)" in
-        docker) migrate_docker_to_native ;;
-        native) die 'Сейчас активна служба. Для этого режима используйте пункт 4.' ;;
-      esac
-      ;;
-    6) show_status_and_links ;;
-    7) remove_all ;;
-    8) safe_cleanup_only ;;
-    0) say 'Выход' ;;
-    *) die 'Неверный выбор' ;;
+new_install_menu() {
+  say ""
+  say "1) Служба + панель"
+  say "2) Только служба"
+  say "3) Docker + панель"
+  say "4) Только Docker"
+  local ch
+  ch=$(ask "Выберите пункт" "1")
+  case "$ch" in
+    1) install_new_service yes ;;
+    2) install_new_service no ;;
+    3) install_new_docker yes ;;
+    4) install_new_docker no ;;
+    *) warn "Неверный выбор" ;;
   esac
 }
 
-main "$@"
+main_menu() {
+  install_base_deps
+  say "═════════════════════════════════════════════════════"
+  say " 🛠️  Telemt Manager"
+  say "═════════════════════════════════════════════════════"
+  say "1) Новая установка"
+  say "2) Установить / обновить / починить панель"
+  say "3) Обновить существующий Telemt"
+  say "4) Миграция service → Docker"
+  say "5) Миграция Docker → service"
+  say "6) Показать статус и ссылки"
+  say "7) Удалить всё, что связано с Telemt"
+  say "8) Очистить мусор (ключи/ссылки не удаляются)"
+  say "0) Выход"
+  local ch
+  ch=$(ask "Выберите пункт" "6")
+  case "$ch" in
+    1) new_install_menu ;;
+    2) repair_or_update_panel ;;
+    3) update_existing_telemt ;;
+    4) migrate_service_to_docker ;;
+    5) migrate_docker_to_service ;;
+    6) show_links ;;
+    7) remove_everything ;;
+    8) safe_cleanup ;;
+    0) exit 0 ;;
+    *) warn "Неверный выбор" ;;
+  esac
+}
+
+main_menu
