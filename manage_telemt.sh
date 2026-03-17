@@ -516,6 +516,47 @@ wait_for_container_running() {
   return 1
 }
 
+port_in_use() {
+  local port="$1"
+  ss -ltnp 2>/dev/null | awk -v p=":${port}" '$4 ~ p"$" || $4 ~ p" " {found=1} END{exit found?0:1}'
+}
+
+wait_for_ports_free() {
+  local timeout="${1:-20}" i
+  for ((i=0; i<timeout; i++)); do
+    if ! port_in_use 443 && ! port_in_use "$API_PORT"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+stop_service_for_migration() {
+  if systemctl list-unit-files 2>/dev/null | grep -q "^${NATIVE_SERVICE}\.service"; then
+    systemctl stop "$NATIVE_SERVICE" >/dev/null 2>&1 || true
+    systemctl disable "$NATIVE_SERVICE" >/dev/null 2>&1 || true
+  fi
+  wait_for_ports_free 20 || {
+    warn "Порты 443/${API_PORT} не освободились после остановки службы"
+    ss -ltnp | grep -E ':(443|'"$API_PORT"')\b' || true
+    return 1
+  }
+}
+
+stop_docker_for_migration() {
+  if docker_exists && docker_daemon_ok; then
+    cd "$WORK_DIR" >/dev/null 2>&1 || true
+    [ -f "$DOCKER_COMPOSE_FILE" ] && compose down --remove-orphans >/dev/null 2>&1 || true
+    docker rm -f "$DOCKER_CONTAINER" >/dev/null 2>&1 || true
+  fi
+  wait_for_ports_free 20 || {
+    warn "Порты 443/${API_PORT} не освободились после остановки Docker"
+    ss -ltnp | grep -E ':(443|'"$API_PORT"')\b' || true
+    return 1
+  }
+}
+
 create_native_service() {
   cat >/etc/systemd/system/${NATIVE_SERVICE}.service <<EOF2
 [Unit]
@@ -924,6 +965,7 @@ new_install_menu() {
       fi
       domain="$(ask 'Домен маскировки' 'google.com')"
       secret="$(generate_secret)"
+      stop_service_for_migration >/dev/null 2>&1 || true
       install_or_update_docker "$([ "$mode" = '2' ] && echo build || echo pull)" "$channel" "$domain" "$secret"
       purge_service_mode >/dev/null 2>&1 || true
       if [ "$c" = '3' ]; then
@@ -985,9 +1027,10 @@ migrate_service_to_docker() {
   fi
   domain="$(read_tls_domain_from_config "$NATIVE_CONFIG")"
   secret="$(read_secret_from_config "$NATIVE_CONFIG")"
+  stop_service_for_migration || die "Не удалось освободить порты перед миграцией в Docker"
   install_or_update_docker "$([ "$mode" = '2' ] && echo build || echo pull)" "$channel" "$domain" "$secret"
-  if panel_exists; then panel_sync_mode docker; systemctl restart "$PANEL_SERVICE" >/dev/null 2>&1 || true; fi
   purge_service_mode
+  if panel_exists; then panel_sync_mode docker; systemctl restart "$PANEL_SERVICE" >/dev/null 2>&1 || true; fi
   auto_cleanup
   ok "Миграция service → Docker завершена"
 }
@@ -998,9 +1041,10 @@ migrate_docker_to_service() {
   domain="$(read_tls_domain_from_config "$DOCKER_CONFIG")"
   secret="$(read_secret_from_config "$DOCKER_CONFIG")"
   channel="$(choose_release_channel)"
+  stop_docker_for_migration || die "Не удалось освободить порты перед миграцией в service"
   install_or_update_service "$channel" "$domain" "$secret"
-  if panel_exists; then panel_sync_mode service; systemctl restart "$PANEL_SERVICE" >/dev/null 2>&1 || true; fi
   purge_docker_mode
+  if panel_exists; then panel_sync_mode service; systemctl restart "$PANEL_SERVICE" >/dev/null 2>&1 || true; fi
   auto_cleanup
   ok "Миграция Docker → service завершена"
 }
