@@ -198,7 +198,17 @@ read_tls_domain_from_config() {
 read_secret_from_config() {
   local cfg="$1"
   [ -f "$cfg" ] || return 0
-  awk -F'"' '/^[[:space:]]*hello[[:space:]]*=/{print $2; exit}' "$cfg"
+  awk -F'"' '/^[[:space:]]*(hello|main_user)[[:space:]]*=/{print $2; exit}' "$cfg"
+}
+
+telegram_proxy_links() {
+  local ip="$1" domain="$2" secret="$3" hex tg_uri tme_url
+  [ -n "$ip" ] && [ -n "$domain" ] && [ -n "$secret" ] || return 0
+  hex="$(printf '%s' "$domain" | xxd -p -c 256)"
+  tg_uri="tg://proxy?server=${ip}&port=443&secret=ee${secret}${hex}"
+  tme_url="https://t.me/proxy?server=${ip}&port=443&secret=ee${secret}${hex}"
+  printf '🔗 TELEGRAM (tg://): %s\n' "$tg_uri"
+  printf '🔗 TELEGRAM (t.me): %s\n' "$tme_url"
 }
 
 write_native_config() {
@@ -827,8 +837,7 @@ show_links() {
   [ -n "$domain" ] && printf '🌐 Домен маскировки: %s\n' "$domain"
   ip="$(get_ext_ip)"
   if [ -n "$ip" ] && [ -n "$domain" ] && [ -n "$secret" ]; then
-    hex="$(printf '%s' "$domain" | xxd -p -c 256)"
-    printf '🔗 TELEGRAM: tg://proxy?server=%s&port=443&secret=ee%s%s\n' "$ip" "$secret" "$hex"
+    telegram_proxy_links "$ip" "$domain" "$secret"
   fi
   if [ -n "$ip" ]; then
     printf '🌐 ПАНЕЛЬ:   http://%s:%s\n' "$ip" "$PANEL_PORT"
