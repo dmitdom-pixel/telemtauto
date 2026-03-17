@@ -719,6 +719,68 @@ delete_panel() {
   say "✅ Панель удалена"
 }
 
+remove_native_mode() {
+  if [[ ! -f "$NATIVE_CONFIG" && ! -f "$NATIVE_BINARY" ]] && ! service_exists; then
+    warn "Служба Telemt не найдена"
+    return 0
+  fi
+  if ! confirm "Удалить только службу Telemt"; then
+    say "Отменено"
+    return 0
+  fi
+
+  stop_native_service
+  rm -f "/etc/systemd/system/${NATIVE_SERVICE}.service"
+  systemctl daemon-reload || true
+  rm -f "$NATIVE_BINARY"
+  rm -rf "$NATIVE_DIR"
+
+  if panel_exists; then
+    if docker_mode_exists; then
+      sync_panel_config docker ""
+      systemctl restart "$PANEL_SERVICE" 2>/dev/null || true
+      say "ℹ️ Панель переключена на Docker-режим"
+    else
+      warn "Панель оставлена установленной, но Telemt сейчас отсутствует"
+    fi
+  fi
+
+  auto_cleanup
+  say "✅ Служба Telemt удалена"
+}
+
+remove_docker_mode() {
+  if [[ ! -f "$WORK_DIR/config.toml" && ! -f "$WORK_DIR/docker-compose.yml" ]] && ! docker_mode_exists; then
+    warn "Docker-режим Telemt не найден"
+    return 0
+  fi
+  if ! confirm "Удалить только Docker-режим Telemt"; then
+    say "Отменено"
+    return 0
+  fi
+
+  stop_docker_stack
+  rm -rf "$WORK_DIR"
+
+  if command -v docker >/dev/null 2>&1; then
+    docker image rm -f "$DOCKER_IMAGE_LOCAL" >/dev/null 2>&1 || true
+    docker image rm -f "$DOCKER_IMAGE_REMOTE" >/dev/null 2>&1 || true
+  fi
+
+  if panel_exists; then
+    if service_exists || [[ -f "$NATIVE_CONFIG" ]]; then
+      sync_panel_config native ""
+      systemctl restart "$PANEL_SERVICE" 2>/dev/null || true
+      say "ℹ️ Панель переключена на service-режим"
+    else
+      warn "Панель оставлена установленной, но Telemt сейчас отсутствует"
+    fi
+  fi
+
+  auto_cleanup
+  say "✅ Docker-режим Telemt удалён"
+}
+
 show_status_links() {
   line
   say "📊 Статус Telemt"
@@ -930,6 +992,26 @@ panel_menu() {
   done
 }
 
+delete_menu() {
+  while true; do
+    say ""
+    say "Удаление Telemt"
+    say "1) Удалить только службу Telemt"
+    say "2) Удалить только Docker-режим Telemt"
+    say "3) Удалить только панель"
+    say "4) Удалить всё, что связано с Telemt"
+    say "0) Назад"
+    case "$(ask 'Выберите пункт' '1')" in
+      1) remove_native_mode; pause_menu; return 0 ;;
+      2) remove_docker_mode; pause_menu; return 0 ;;
+      3) delete_panel; pause_menu; return 0 ;;
+      4) remove_all_telemt; pause_menu; return 0 ;;
+      0) return 0 ;;
+      *) warn "Неверный выбор" ;;
+    esac
+  done
+}
+
 new_install_menu() {
   while true; do
     say ""
@@ -978,7 +1060,7 @@ main_menu() {
     say "4) Миграция service → Docker"
     say "5) Миграция Docker → service"
     say "6) Показать статус и ссылки"
-    say "7) Удалить всё, что связано с Telemt"
+    say "7) Удаление Telemt / панели"
     say "8) Очистить мусор (ключи/ссылки не удаляются)"
     say "0) Выход"
     case "$(ask 'Выберите пункт' '6')" in
@@ -988,7 +1070,7 @@ main_menu() {
       4) migrate_service_to_docker; pause_menu ;;
       5) migrate_docker_to_service; pause_menu ;;
       6) show_status_links; pause_menu ;;
-      7) remove_all_telemt; pause_menu ;;
+      7) delete_menu ;;
       8) cleanup_junk_only; pause_menu ;;
       0) break ;;
       *) warn "Неверный выбор"; pause_menu ;;
