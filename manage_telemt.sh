@@ -19,6 +19,7 @@ TTY_INPUT="/dev/tty"
 [ -r "$TTY_INPUT" ] || TTY_INPUT="/dev/stdin"
 
 say() { printf '%s\n' "$*"; }
+menu() { printf '%s\n' "$*" >"$TTY_INPUT"; }
 warn() { printf '⚠️ %s\n' "$*" >&2; }
 die() { printf '❌ %s\n' "$*" >&2; exit 1; }
 
@@ -37,31 +38,12 @@ ask() {
   fi
 }
 
-pause_if_needed() {
-  :
-}
-
 install_base_deps() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  local pkgs=(
-    ca-certificates
-    curl
-    git
-    openssl
-    python3
-    python3-venv
-    tar
-    gzip
-    sed
-    grep
-    coreutils
-    util-linux
-    passwd
-    systemd
-    jq
-  )
-  apt-get install -yqq "${pkgs[@]}"
+  apt-get install -yqq \
+    ca-certificates curl git openssl python3 python3-venv \
+    tar gzip sed grep coreutils util-linux passwd systemd jq
 }
 
 ensure_docker() {
@@ -73,29 +55,29 @@ ensure_docker() {
   if ! docker compose version >/dev/null 2>&1; then
     say "📦 Устанавливаем Docker Compose v2"
     apt-get update -qq
-    apt-get install -yqq docker-compose-plugin || true
+    apt-get install -yqq docker-compose-plugin
   fi
 
   docker version >/dev/null 2>&1 || die "Docker недоступен"
-  docker compose version >/dev/null 2>&1 || die "Нужен Docker Compose v2 (команда docker compose)"
+  docker compose version >/dev/null 2>&1 || die "Нужен Docker Compose v2"
 }
 
 ensure_rust() {
   if ! command -v cargo >/dev/null 2>&1; then
-    say "🦀 Устанавливаем Rust toolchain"
+    say "🦀 Устанавливаем Rust"
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
   fi
   # shellcheck disable=SC1090
   [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
-  command -v cargo >/dev/null 2>&1 || die "cargo не найден после установки Rust"
+  command -v cargo >/dev/null 2>&1 || die "cargo не найден"
 }
 
 choose_branch_mode() {
-  say ""
-  say "Выберите ветку Telemt:"
-  say "1) LTS / стабильный релиз"
-  say "2) Latest / самый свежий релиз"
   local ch
+  menu ""
+  menu "Выберите ветку Telemt:"
+  menu "1) Stable / LTS"
+  menu "2) Latest"
   ch=$(ask "Выберите пункт" "1")
   case "$ch" in
     1) printf 'stable' ;;
@@ -105,11 +87,11 @@ choose_branch_mode() {
 }
 
 choose_docker_source() {
-  say ""
-  say "Как обновлять / ставить Docker-версию Telemt:"
-  say "1) Docker pull готового образа"
-  say "2) Сборка Docker-образа из исходников"
   local ch
+  menu ""
+  menu "Как установить / обновить Docker-версию Telemt:"
+  menu "1) Docker pull готового образа"
+  menu "2) Сборка Docker-образа из исходников"
   ch=$(ask "Выберите пункт" "1")
   case "$ch" in
     1) printf 'pull' ;;
@@ -123,7 +105,7 @@ clone_telemt_source() {
   rm -rf "$BUILD_DIR"
   mkdir -p "$WORK_DIR"
   git clone https://github.com/telemt/telemt.git "$BUILD_DIR"
-  cd "$BUILD_DIR"
+  cd "$BUILD_DIR" || exit 1
 
   local tag=""
   if [ "$branch_mode" = "stable" ]; then
@@ -276,7 +258,6 @@ if not seen:
 p.write_text('\n'.join(out) + '\n')
 PY
   chmod 600 "$NATIVE_CONFIG"
-  chown -R "$NATIVE_USER:$NATIVE_USER" "$NATIVE_DIR"
 }
 
 ensure_docker_api_config() {
@@ -383,17 +364,15 @@ services:
       - "443:443"
       - "127.0.0.1:9091:9091"
     working_dir: /run/telemt
+    command: ["/bin/sh", "-lc", "exec telemt /run/telemt/config.toml"]
     volumes:
       - ./config.toml:/run/telemt/config.toml:ro
-    tmpfs:
-      - /run/telemt:rw,mode=1777,size=1m
     environment:
       - RUST_LOG=info
     cap_drop:
       - ALL
     cap_add:
       - NET_BIND_SERVICE
-    read_only: true
     security_opt:
       - no-new-privileges:true
     ulimits:
@@ -410,7 +389,7 @@ compose() {
 start_docker_stack() {
   ensure_docker
   write_docker_compose
-  cd "$WORK_DIR"
+  cd "$WORK_DIR" || exit 1
   compose down --remove-orphans >/dev/null 2>&1 || true
   docker rm -f "$DOCKER_CONTAINER" >/dev/null 2>&1 || true
   compose up -d
@@ -418,7 +397,7 @@ start_docker_stack() {
 
 stop_and_remove_docker_stack() {
   if [ -f "$WORK_DIR/docker-compose.yml" ]; then
-    cd "$WORK_DIR"
+    cd "$WORK_DIR" || exit 1
     compose down --remove-orphans >/dev/null 2>&1 || true
   fi
   docker rm -f "$DOCKER_CONTAINER" >/dev/null 2>&1 || true
@@ -454,9 +433,6 @@ sync_panel_config() {
   local mode="$1"
   [ -f "$PANEL_CONFIG" ] || return 0
   local telemt_url="http://127.0.0.1:9091"
-  if [ "$mode" = "docker" ]; then
-    telemt_url="http://127.0.0.1:9091"
-  fi
   python3 - "$PANEL_CONFIG" "$telemt_url" <<'PY'
 from pathlib import Path
 import sys
@@ -578,7 +554,6 @@ install_new_service() {
   secret=$(openssl rand -hex 16)
 
   stop_and_remove_docker_stack
-
   install_base_deps
   build_native_binary "$branch_mode"
   ensure_native_user
@@ -791,12 +766,13 @@ safe_cleanup() {
 }
 
 new_install_menu() {
+  local ch
   say ""
+  say "Новая установка:"
   say "1) Служба + панель"
   say "2) Только служба"
   say "3) Docker + панель"
   say "4) Только Docker"
-  local ch
   ch=$(ask "Выберите пункт" "1")
   case "$ch" in
     1) install_new_service yes ;;
