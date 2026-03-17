@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 WORK_DIR="$HOME/telemt-proxy"
 BUILD_DIR="$WORK_DIR/build_telemt"
@@ -16,6 +16,8 @@ PANEL_SERVICE="telemt-panel"
 
 DOCKER_IMAGE="ghcr.io/telemt/telemt:latest"
 DOCKER_CONTAINER="telemt_proxy"
+DOCKER_COMPOSE_FILE="$WORK_DIR/docker-compose.yml"
+DOCKER_CONFIG="$WORK_DIR/config.toml"
 
 TTY_INPUT="/dev/tty"
 [ -r "$TTY_INPUT" ] || TTY_INPUT="/dev/stdin"
@@ -23,6 +25,8 @@ TTY_INPUT="/dev/tty"
 say()  { printf '%s\n' "$*"; }
 warn() { printf '⚠️ %s\n' "$*" >&2; }
 die()  { printf '❌ %s\n' "$*" >&2; exit 1; }
+
+trap 'warn "Скрипт остановлен на строке $LINENO"' ERR
 
 [ "$(id -u)" -eq 0 ] || die "Запускайте этот скрипт от root"
 
@@ -44,46 +48,8 @@ pause() {
   IFS= read -r -p "Нажмите Enter, чтобы вернуться в меню..." _ <"$TTY_INPUT"
 }
 
-install_base_deps() {
-  apt-get update -qq
-  apt-get install -yqq \
-    ca-certificates curl git openssl sed grep coreutils util-linux \
-    tar gzip xz-utils systemd jq python3
-  if ! command -v awk >/dev/null 2>&1; then
-    apt-get install -yqq mawk || apt-get install -yqq gawk
-  fi
-}
-
-install_build_deps() {
-  apt-get update -qq
-  apt-get install -yqq build-essential pkg-config libssl-dev
-}
-
-ensure_rust() {
-  if command -v cargo >/dev/null 2>&1; then
-    return 0
-  fi
-  say "🦀 Устанавливаем Rust"
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-  # shellcheck disable=SC1090
-  source "$HOME/.cargo/env"
-}
-
-ensure_docker_client_only() {
-  if command -v docker >/dev/null 2>&1; then
-    return 0
-  fi
-  warn "Docker не найден. Для миграции Docker -> служба нужен docker-клиент."
-  warn "Если Docker у вас уже должен быть, установите/почините его отдельно."
-  die "Команда docker недоступна"
-}
-
-docker_compose_cmd() {
-  if docker compose version >/dev/null 2>&1; then
-    echo "docker compose"
-    return 0
-  fi
-  die "Docker Compose v2 не найден"
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
 }
 
 service_exists() {
@@ -94,12 +60,20 @@ service_active() {
   systemctl is-active --quiet "$NATIVE_SERVICE" 2>/dev/null
 }
 
-panel_exists() {
-  systemctl list-unit-files | grep -q "^${PANEL_SERVICE}\.service" || [ -f "$PANEL_CONFIG" ] || [ -x "$PANEL_BINARY" ]
-}
-
 panel_active() {
   systemctl is-active --quiet "$PANEL_SERVICE" 2>/dev/null
+}
+
+panel_exists() {
+  [ -x "$PANEL_BINARY" ] || [ -f "$PANEL_CONFIG" ] || systemctl list-unit-files | grep -q "^${PANEL_SERVICE}\.service"
+}
+
+docker_client_available() {
+  command_exists docker
+}
+
+docker_compose_available() {
+  docker compose version >/dev/null 2>&1
 }
 
 docker_telemt_exists() {
@@ -110,26 +84,46 @@ docker_telemt_running() {
   docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${DOCKER_CONTAINER}$"
 }
 
-wait_port_free() {
-  local ports_regex="$1"
-  local i
-  for i in $(seq 1 20); do
-    if ! ss -ltnp 2>/dev/null | grep -qE "$ports_regex"; then
-      return 0
-    fi
-    sleep 1
-  done
-  return 1
+install_base_deps() {
+  apt-get update -qq
+  apt-get install -yqq \
+    ca-certificates curl git openssl jq python3 \
+    sed grep coreutils util-linux tar gzip xz-utils \
+    build-essential pkg-config libssl-dev xxd
+  if ! command_exists awk; then
+    apt-get install -yqq mawk || apt-get install -yqq gawk
+  fi
+}
+
+ensure_rust() {
+  if command_exists cargo; then
+    return 0
+  fi
+  say "🦀 Устанавливаем Rust"
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+}
+
+load_rust_env() {
+  if [ -f "$HOME/.cargo/env" ]; then
+    # shellcheck disable=SC1090
+    source "$HOME/.cargo/env"
+  fi
+  command_exists cargo || die "cargo не найден после установки Rust"
 }
 
 get_public_ip() {
   curl -fsS --max-time 8 -4 ifconfig.me 2>/dev/null || true
 }
 
-read_domain_from_cfg() {
+read_cfg_value() {
   local cfg="$1"
+  local key="$2"
   [ -f "$cfg" ] || return 0
-  awk -F'"' '/^tls_domain[[:space:]]*=/{print $2; exit}' "$cfg"
+  awk -F'"' -v k="$key" '$0 ~ "^"k"[[:space:]]*=" {print $2; exit}' "$cfg"
+}
+
+read_domain_from_cfg() {
+  read_cfg_value "$1" "tls_domain"
 }
 
 read_secret_from_cfg() {
@@ -147,12 +141,12 @@ print_links_for_cfg() {
   secret="$(read_secret_from_cfg "$cfg")"
   ip="$(get_public_ip)"
 
-  [ -n "$domain" ] || return 0
-  [ -n "$secret" ] || return 0
+  [ -n "$domain" ] || { warn "Не найден tls_domain в $cfg"; return 0; }
+  [ -n "$secret" ] || { warn "Не найден secret в $cfg"; return 0; }
 
   hex="$(printf '%s' "$domain" | xxd -p -c 999 | tr -d '\n')"
 
-  say "📄 Конфиг: $cfg"
+  say "📄 Активный конфиг: $cfg"
   say "🌍 Домен маскировки: $domain"
 
   if [ -n "$ip" ]; then
@@ -217,8 +211,6 @@ PY
 sync_panel_for_service() {
   [ -f "$PANEL_CONFIG" ] || return 0
 
-  mkdir -p "$PANEL_DIR"
-
   python3 - "$PANEL_CONFIG" <<'PY'
 from pathlib import Path
 import sys
@@ -231,60 +223,60 @@ if "[telemt]" not in text:
 
 lines = text.splitlines()
 out = []
-in_telemt = False
+in_block = False
 seen_url = False
 seen_auth = False
 seen_bin = False
 seen_srv = False
 
-def flush_missing(out_list):
+def emit_missing(dst):
     global seen_url, seen_auth, seen_bin, seen_srv
     if not seen_url:
-        out_list.append('url = "http://127.0.0.1:9091"')
+        dst.append('url = "http://127.0.0.1:9091"')
     if not seen_auth:
-        out_list.append('auth_header = ""')
+        dst.append('auth_header = ""')
     if not seen_bin:
-        out_list.append('binary_path = "/bin/telemt"')
+        dst.append('binary_path = "/bin/telemt"')
     if not seen_srv:
-        out_list.append('service_name = "telemt"')
+        dst.append('service_name = "telemt"')
 
 for line in lines:
     s = line.strip()
     if s == "[telemt]":
-        in_telemt = True
+        in_block = True
         out.append(line)
         continue
 
-    if in_telemt and s.startswith("[") and s != "[telemt]":
-        flush_missing(out)
-        in_telemt = False
+    if in_block and s.startswith("[") and s != "[telemt]":
+        emit_missing(out)
+        in_block = False
         out.append(line)
         continue
 
-    if in_telemt and s.startswith("url ="):
+    if in_block and s.startswith("url ="):
         out.append('url = "http://127.0.0.1:9091"')
         seen_url = True
         continue
 
-    if in_telemt and s.startswith("auth_header ="):
+    if in_block and s.startswith("auth_header ="):
         out.append('auth_header = ""')
         seen_auth = True
         continue
 
-    if in_telemt and s.startswith("binary_path ="):
+    if in_block and s.startswith("binary_path ="):
         out.append('binary_path = "/bin/telemt"')
         seen_bin = True
         continue
 
-    if in_telemt and s.startswith("service_name ="):
+    if in_block and s.startswith("service_name ="):
         out.append('service_name = "telemt"')
         seen_srv = True
         continue
 
     out.append(line)
 
-if in_telemt:
-    flush_missing(out)
+if in_block:
+    emit_missing(out)
 
 cfg.write_text("\n".join(out) + "\n")
 PY
@@ -312,27 +304,26 @@ clone_telemt_source() {
 
   rm -rf "$BUILD_DIR"
   mkdir -p "$WORK_DIR"
-  git clone --depth 1 https://github.com/telemt/telemt.git "$BUILD_DIR"
+
+  git clone https://github.com/telemt/telemt.git "$BUILD_DIR" >/dev/null 2>&1 || die "Не удалось клонировать telemt"
 
   (
     cd "$BUILD_DIR"
-
     git fetch --tags --force >/dev/null 2>&1 || true
 
+    local tag=""
     if [ "$version_mode" = "stable" ]; then
-      local tag
       tag="$(git tag --sort=-v:refname | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | head -n1)"
       [ -n "$tag" ] || die "Не удалось определить stable tag"
-      say "📌 Ставим stable tag: $tag"
-      git checkout "$tag" >/dev/null 2>&1
+      say "📌 Stable / LTS: $tag"
     else
-      local tag
       tag="$(git tag --sort=-creatordate | head -n1)"
       [ -n "$tag" ] || tag="$(git tag --sort=-v:refname | head -n1)"
       [ -n "$tag" ] || die "Не удалось определить latest tag"
-      say "📌 Ставим latest tag: $tag"
-      git checkout "$tag" >/dev/null 2>&1
+      say "📌 Latest: $tag"
     fi
+
+    git checkout "$tag" >/dev/null 2>&1 || die "Не удалось переключиться на tag $tag"
   )
 }
 
@@ -358,6 +349,69 @@ EOF
   ensure_native_api_config
 }
 
+create_native_service_unit() {
+  cat > "/etc/systemd/system/${NATIVE_SERVICE}.service" <<EOF
+[Unit]
+Description=Telemt Proxy
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=$NATIVE_BINARY $NATIVE_CONFIG
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65536
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+wait_service_active() {
+  local service="$1"
+  local i
+  for i in $(seq 1 20); do
+    if systemctl is-active --quiet "$service" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+wait_port_free() {
+  local regex="$1"
+  local i
+  for i in $(seq 1 20); do
+    if ! ss -ltnp 2>/dev/null | grep -qE "$regex"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+ensure_docker_ready() {
+  docker_client_available || die "Команда docker не найдена"
+  docker_compose_available || die "Docker Compose v2 не найден"
+
+  if systemctl list-unit-files | grep -q '^docker\.service'; then
+    systemctl start docker >/dev/null 2>&1 || true
+  fi
+
+  local i
+  for i in $(seq 1 20); do
+    if [ -S /var/run/docker.sock ] && docker version >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  die "Docker daemon не готов"
+}
+
 install_or_update_panel_for_service() {
   install_base_deps
 
@@ -372,10 +426,8 @@ install_or_update_panel_for_service() {
 
 install_service_and_panel() {
   install_base_deps
-  install_build_deps
   ensure_rust
-  # shellcheck disable=SC1090
-  [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
+  load_rust_env
 
   local version_mode domain secret
   version_mode="$(choose_version_mode)"
@@ -392,30 +444,11 @@ install_service_and_panel() {
   install -m 0755 "$BUILD_DIR/target/release/telemt" "$NATIVE_BINARY"
 
   create_native_config "$domain" "$secret"
-
-  cat > "/etc/systemd/system/${NATIVE_SERVICE}.service" <<EOF
-[Unit]
-Description=Telemt Proxy
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=$NATIVE_BINARY $NATIVE_CONFIG
-Restart=on-failure
-RestartSec=2
-LimitNOFILE=65536
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-
-[Install]
-WantedBy=multi-user.target
-EOF
+  create_native_service_unit
 
   systemctl daemon-reload
   systemctl enable --now "$NATIVE_SERVICE"
-
-  sleep 2
-  service_active || die "Telemt service не поднялся"
+  wait_service_active "$NATIVE_SERVICE" || die "Telemt service не поднялся"
 
   install_or_update_panel_for_service
 
@@ -423,14 +456,12 @@ EOF
 }
 
 migrate_docker_to_service() {
-  ensure_docker_client_only
+  ensure_docker_ready
   install_base_deps
-  install_build_deps
   ensure_rust
-  # shellcheck disable=SC1090
-  [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
+  load_rust_env
 
-  [ -f "$CFG" ] || die "Не найден Docker-конфиг: $CFG"
+  [ -f "$DOCKER_CONFIG" ] || die "Не найден Docker-конфиг: $DOCKER_CONFIG"
 
   local version_mode
   version_mode="$(choose_version_mode)"
@@ -445,17 +476,14 @@ migrate_docker_to_service() {
   install -m 0755 "$BUILD_DIR/target/release/telemt" "$NATIVE_BINARY"
 
   mkdir -p "$NATIVE_DIR"
-  cp "$CFG" "$NATIVE_CONFIG"
+  cp "$DOCKER_CONFIG" "$NATIVE_CONFIG"
   chmod 600 "$NATIVE_CONFIG"
   ensure_native_api_config
 
-  local compose_cmd
-  compose_cmd="$(docker_compose_cmd)"
-
-  if [ -f "$COMPOSE" ]; then
+  if [ -f "$DOCKER_COMPOSE_FILE" ]; then
     (
       cd "$WORK_DIR"
-      $compose_cmd down >/dev/null 2>&1 || true
+      docker compose down >/dev/null 2>&1 || true
     )
   fi
 
@@ -467,29 +495,11 @@ migrate_docker_to_service() {
     die "Не удалось освободить порты перед запуском службы"
   fi
 
-  cat > "/etc/systemd/system/${NATIVE_SERVICE}.service" <<EOF
-[Unit]
-Description=Telemt Proxy
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=$NATIVE_BINARY $NATIVE_CONFIG
-Restart=on-failure
-RestartSec=2
-LimitNOFILE=65536
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-
-[Install]
-WantedBy=multi-user.target
-EOF
+  create_native_service_unit
 
   systemctl daemon-reload
   systemctl enable --now "$NATIVE_SERVICE"
-
-  sleep 2
-  service_active || die "После миграции служба Telemt не поднялась"
+  wait_service_active "$NATIVE_SERVICE" || die "После миграции служба Telemt не поднялась"
 
   if panel_exists; then
     sync_panel_for_service
@@ -511,7 +521,7 @@ deep_cleanup_keep_amnezia() {
   rm -rf "$BUILD_DIR" 2>/dev/null || true
   rm -rf "$HOME/.cargo/registry" "$HOME/.cargo/git" 2>/dev/null || true
 
-  if command -v docker >/dev/null 2>&1 && systemctl is-active --quiet docker 2>/dev/null; then
+  if docker_client_available && systemctl is-active --quiet docker 2>/dev/null; then
     docker container prune -f || true
     docker image prune -f || true
     docker builder prune -a -f || true
@@ -550,8 +560,8 @@ show_current_links() {
 
   if [ -f "$NATIVE_CONFIG" ]; then
     print_links_for_cfg "$NATIVE_CONFIG"
-  elif [ -f "$CFG" ]; then
-    print_links_for_cfg "$CFG"
+  elif [ -f "$DOCKER_CONFIG" ]; then
+    print_links_for_cfg "$DOCKER_CONFIG"
   else
     warn "Конфиг Telemt не найден"
   fi
@@ -577,13 +587,11 @@ delete_all_telemt() {
   rm -f "$NATIVE_BINARY"
   rm -rf "$NATIVE_DIR"
 
-  if command -v docker >/dev/null 2>&1; then
-    local compose_cmd
-    if docker compose version >/dev/null 2>&1; then
-      compose_cmd="docker compose"
-      [ -f "$COMPOSE" ] && (
+  if docker_client_available; then
+    if docker_compose_available && [ -f "$DOCKER_COMPOSE_FILE" ]; then
+      (
         cd "$WORK_DIR"
-        $compose_cmd down >/dev/null 2>&1 || true
+        docker compose down >/dev/null 2>&1 || true
       )
     fi
     docker rm -f "$DOCKER_CONTAINER" >/dev/null 2>&1 || true
