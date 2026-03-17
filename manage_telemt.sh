@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-WORK_DIR="$HOME/telemt-proxy"
+WORK_DIR="/root/telemt-proxy"
 BUILD_DIR="$WORK_DIR/build_telemt"
 
+NATIVE_USER="telemt"
+NATIVE_HOME="/opt/telemt"
+NATIVE_BIN="/bin/telemt"
 NATIVE_DIR="/etc/telemt"
 NATIVE_CONFIG="$NATIVE_DIR/telemt.toml"
-NATIVE_BINARY="/bin/telemt"
 NATIVE_SERVICE="telemt"
 
+PANEL_BIN="/usr/local/bin/telemt-panel"
 PANEL_DIR="/etc/telemt-panel"
 PANEL_CONFIG="$PANEL_DIR/config.toml"
-PANEL_BINARY="/usr/local/bin/telemt-panel"
 PANEL_SERVICE="telemt-panel"
 
-DOCKER_IMAGE="ghcr.io/telemt/telemt:latest"
 DOCKER_CONTAINER="telemt_proxy"
-DOCKER_COMPOSE_FILE="$WORK_DIR/docker-compose.yml"
-DOCKER_CONFIG="$WORK_DIR/config.toml"
+DOCKER_IMAGE="ghcr.io/telemt/telemt:latest"
 
 TTY_INPUT="/dev/tty"
 [ -r "$TTY_INPUT" ] || TTY_INPUT="/dev/stdin"
@@ -26,9 +26,9 @@ say()  { printf '%s\n' "$*"; }
 warn() { printf '⚠️ %s\n' "$*" >&2; }
 die()  { printf '❌ %s\n' "$*" >&2; exit 1; }
 
-trap 'warn "Скрипт остановлен на строке $LINENO"' ERR
+trap 'warn "Ошибка на строке $LINENO"' ERR
 
-[ "$(id -u)" -eq 0 ] || die "Запускайте этот скрипт от root"
+[ "$(id -u)" -eq 0 ] || die "Запускай от root"
 
 ask() {
   local prompt="$1"
@@ -48,8 +48,20 @@ pause() {
   IFS= read -r -p "Нажмите Enter, чтобы вернуться в меню..." _ <"$TTY_INPUT"
 }
 
-command_exists() {
-  command -v "$1" >/dev/null 2>&1
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Не найдена команда: $1"
+}
+
+docker_client_available() {
+  command -v docker >/dev/null 2>&1
+}
+
+docker_compose_available() {
+  docker compose version >/dev/null 2>&1
+}
+
+docker_daemon_ready() {
+  docker version >/dev/null 2>&1
 }
 
 service_exists() {
@@ -60,55 +72,46 @@ service_active() {
   systemctl is-active --quiet "$NATIVE_SERVICE" 2>/dev/null
 }
 
+panel_exists() {
+  [ -x "$PANEL_BIN" ] || [ -f "$PANEL_CONFIG" ] || systemctl list-unit-files | grep -q "^${PANEL_SERVICE}\.service"
+}
+
 panel_active() {
   systemctl is-active --quiet "$PANEL_SERVICE" 2>/dev/null
 }
 
-panel_exists() {
-  [ -x "$PANEL_BINARY" ] || [ -f "$PANEL_CONFIG" ] || systemctl list-unit-files | grep -q "^${PANEL_SERVICE}\.service"
+wait_service_active() {
+  local service="$1"
+  local i
+  for i in $(seq 1 30); do
+    if systemctl is-active --quiet "$service" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
 }
 
-docker_client_available() {
-  command_exists docker
-}
-
-docker_compose_available() {
-  docker compose version >/dev/null 2>&1
-}
-
-docker_telemt_exists() {
-  docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${DOCKER_CONTAINER}$"
-}
-
-docker_telemt_running() {
-  docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${DOCKER_CONTAINER}$"
+wait_port_free() {
+  local port="$1"
+  local i
+  for i in $(seq 1 30); do
+    if ! ss -ltnp 2>/dev/null | grep -q ":${port}\b"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
 }
 
 install_base_deps() {
   apt-get update -qq
   apt-get install -yqq \
-    ca-certificates curl git openssl jq python3 \
-    sed grep coreutils util-linux tar gzip xz-utils \
-    build-essential pkg-config libssl-dev xxd
-  if ! command_exists awk; then
+    ca-certificates curl jq openssl python3 tar xz-utils \
+    sed grep coreutils util-linux xxd
+  if ! command -v awk >/dev/null 2>&1; then
     apt-get install -yqq mawk || apt-get install -yqq gawk
   fi
-}
-
-ensure_rust() {
-  if command_exists cargo; then
-    return 0
-  fi
-  say "🦀 Устанавливаем Rust"
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-}
-
-load_rust_env() {
-  if [ -f "$HOME/.cargo/env" ]; then
-    # shellcheck disable=SC1090
-    source "$HOME/.cargo/env"
-  fi
-  command_exists cargo || die "cargo не найден после установки Rust"
 }
 
 get_public_ip() {
@@ -160,14 +163,56 @@ print_links_for_cfg() {
   fi
 }
 
-ensure_native_api_config() {
-  [ -f "$NATIVE_CONFIG" ] || return 0
+detect_arch() {
+  case "$(uname -m)" in
+    x86_64) echo "x86_64" ;;
+    aarch64|arm64) echo "aarch64" ;;
+    *) die "Неподдерживаемая архитектура: $(uname -m)" ;;
+  esac
+}
 
-  python3 - "$NATIVE_CONFIG" <<'PY'
+detect_libc() {
+  if ldd --version 2>&1 | grep -qi musl; then
+    echo "musl"
+  else
+    echo "gnu"
+  fi
+}
+
+download_latest_telemt() {
+  local arch libc url tmpdir
+  arch="$(detect_arch)"
+  libc="$(detect_libc)"
+
+  url="$(curl -fsSL https://api.github.com/repos/telemt/telemt/releases/latest \
+    | jq -r --arg a "$arch" --arg l "$libc" \
+      '.assets[]?.browser_download_url
+       | select(test("telemt-" + $a + "-linux-" + $l + "\\.tar\\.gz$"))' \
+    | head -n1)"
+
+  [ -n "$url" ] || die "Не удалось найти подходящий релиз Telemt для ${arch}/${libc}"
+
+  say "📦 Скачиваем Telemt: $url"
+  tmpdir="$(mktemp -d)"
+  curl -fL "$url" -o "$tmpdir/telemt.tar.gz" || die "Не удалось скачать бинарник Telemt"
+  tar -xzf "$tmpdir/telemt.tar.gz" -C "$tmpdir"
+  [ -f "$tmpdir/telemt" ] || die "В архиве не найден бинарник telemt"
+  install -m 0755 "$tmpdir/telemt" "$NATIVE_BIN"
+  rm -rf "$tmpdir"
+}
+
+prepare_user_and_dirs() {
+  useradd -d "$NATIVE_HOME" -m -r -U "$NATIVE_USER" 2>/dev/null || true
+  mkdir -p "$NATIVE_DIR"
+}
+
+patch_native_api_config() {
+  [ -f "$NATIVE_CONFIG" ] || die "Не найден $NATIVE_CONFIG"
+
+  python3 - <<'PY'
 from pathlib import Path
-import sys
 
-cfg = Path(sys.argv[1])
+cfg = Path("/etc/telemt/telemt.toml")
 text = cfg.read_text()
 
 block = """[server.api]
@@ -204,18 +249,51 @@ if not seen:
 
 cfg.write_text("\n".join(out) + "\n")
 PY
+}
 
-  chmod 600 "$NATIVE_CONFIG"
+fix_native_permissions() {
+  chown -R "$NATIVE_USER:$NATIVE_USER" "$NATIVE_DIR"
+  chmod 750 "$NATIVE_DIR"
+  chmod 640 "$NATIVE_CONFIG"
+}
+
+write_service_unit() {
+  cat > "/etc/systemd/system/${NATIVE_SERVICE}.service" <<'EOF'
+[Unit]
+Description=Telemt
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=telemt
+Group=telemt
+WorkingDirectory=/opt/telemt
+ExecStart=/bin/telemt /etc/telemt/telemt.toml
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65536
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+check_native_api() {
+  curl -fsS http://127.0.0.1:9091/v1/users | jq . >/dev/null
+  say "✅ Telemt API отвечает на 127.0.0.1:9091"
 }
 
 sync_panel_for_service() {
-  [ -f "$PANEL_CONFIG" ] || return 0
+  [ -f "$PANEL_CONFIG" ] || die "Не найден конфиг панели: $PANEL_CONFIG"
 
-  python3 - "$PANEL_CONFIG" <<'PY'
+  python3 - <<'PY'
 from pathlib import Path
-import sys
 
-cfg = Path(sys.argv[1])
+cfg = Path("/etc/telemt-panel/config.toml")
 text = cfg.read_text()
 
 if "[telemt]" not in text:
@@ -242,6 +320,7 @@ def emit_missing(dst):
 
 for line in lines:
     s = line.strip()
+
     if s == "[telemt]":
         in_block = True
         out.append(line)
@@ -280,58 +359,80 @@ if in_block:
 
 cfg.write_text("\n".join(out) + "\n")
 PY
-
-  chmod 600 "$PANEL_CONFIG"
-  systemctl restart "$PANEL_SERVICE" 2>/dev/null || true
 }
 
-choose_version_mode() {
-  printf '\n'
-  say "Какую версию ставить?"
-  say "1) Stable / LTS"
-  say "2) Latest"
-  local choice
-  choice="$(ask "Выберите пункт" "1")"
-  case "$choice" in
-    1) echo "stable" ;;
-    2) echo "latest" ;;
-    *) echo "stable" ;;
-  esac
+install_or_update_panel() {
+  say "📦 Устанавливаем / обновляем Telemt Panel"
+  curl -fsSL https://raw.githubusercontent.com/amirotin/telemt_panel/main/install.sh | bash
+  [ -f "$PANEL_CONFIG" ] || die "После установки панели не найден $PANEL_CONFIG"
+  sync_panel_for_service
+  systemctl enable --now "$PANEL_SERVICE" 2>/dev/null || true
+  systemctl restart "$PANEL_SERVICE"
 }
 
-clone_telemt_source() {
-  local version_mode="$1"
-
-  rm -rf "$BUILD_DIR"
-  mkdir -p "$WORK_DIR"
-
-  git clone https://github.com/telemt/telemt.git "$BUILD_DIR" >/dev/null 2>&1 || die "Не удалось клонировать telemt"
-
-  (
-    cd "$BUILD_DIR"
-    git fetch --tags --force >/dev/null 2>&1 || true
-
-    local tag=""
-    if [ "$version_mode" = "stable" ]; then
-      tag="$(git tag --sort=-v:refname | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | head -n1)"
-      [ -n "$tag" ] || die "Не удалось определить stable tag"
-      say "📌 Stable / LTS: $tag"
-    else
-      tag="$(git tag --sort=-creatordate | head -n1)"
-      [ -n "$tag" ] || tag="$(git tag --sort=-v:refname | head -n1)"
-      [ -n "$tag" ] || die "Не удалось определить latest tag"
-      say "📌 Latest: $tag"
-    fi
-
-    git checkout "$tag" >/dev/null 2>&1 || die "Не удалось переключиться на tag $tag"
-  )
+stop_only_telemt_docker() {
+  if docker_client_available; then
+    docker stop "$DOCKER_CONTAINER" >/dev/null 2>&1 || true
+    docker rm "$DOCKER_CONTAINER" >/dev/null 2>&1 || true
+  fi
 }
 
-create_native_config() {
-  local domain="$1"
-  local secret="$2"
+remove_only_telemt_docker_traces() {
+  if ! docker_client_available; then
+    return 0
+  fi
 
-  mkdir -p "$NATIVE_DIR"
+  docker stop "$DOCKER_CONTAINER" >/dev/null 2>&1 || true
+  docker rm "$DOCKER_CONTAINER" >/dev/null 2>&1 || true
+  docker image rm "$DOCKER_IMAGE" >/dev/null 2>&1 || true
+  docker network rm telemt-proxy_default >/dev/null 2>&1 || true
+  rm -rf "$WORK_DIR"
+}
+
+safe_cleanup_keep_amnezia() {
+  say "🧹 Безопасная очистка мусора"
+  apt-get clean
+  journalctl --vacuum-time=7d || true
+  rm -rf "$BUILD_DIR" 2>/dev/null || true
+  rm -rf /tmp/* /var/tmp/* 2>/dev/null || true
+
+  if docker_client_available && docker_daemon_ready; then
+    docker container prune -f || true
+    docker image prune -f || true
+    docker builder prune -a -f || true
+  else
+    warn "Docker daemon не запущен, docker-prune пропущен"
+  fi
+
+  say "✅ Очистка завершена"
+  df -h /
+}
+
+detect_docker_config_source() {
+  local src=""
+  if docker_client_available && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${DOCKER_CONTAINER}$"; then
+    src="$(docker inspect "$DOCKER_CONTAINER" \
+      --format '{{range .Mounts}}{{println .Source " " .Destination}}{{end}}' \
+      | awk '$2 ~ /\/config\.toml$/ {print $1; exit}')"
+  fi
+
+  if [ -z "$src" ] && [ -f "$DOCKER_WORKDIR/config.toml" ]; then
+    src="$DOCKER_WORKDIR/config.toml"
+  fi
+
+  [ -n "$src" ] || die "Не удалось определить путь к docker config.toml"
+  printf '%s' "$src"
+}
+
+install_service_and_panel() {
+  install_base_deps
+  download_latest_telemt
+  prepare_user_and_dirs
+
+  local domain secret
+  domain="$(ask "Под какой домен маскируемся" "google.com")"
+  secret="$(openssl rand -hex 16)"
+
   cat > "$NATIVE_CONFIG" <<EOF
 users = [ "me" ]
 ad_tag = ""
@@ -345,205 +446,84 @@ listener = "0.0.0.0:443"
 main_user = "$secret"
 EOF
 
-  chmod 600 "$NATIVE_CONFIG"
-  ensure_native_api_config
-}
+  patch_native_api_config
+  fix_native_permissions
+  write_service_unit
 
-create_native_service_unit() {
-  cat > "/etc/systemd/system/${NATIVE_SERVICE}.service" <<EOF
-[Unit]
-Description=Telemt Proxy
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=$NATIVE_BINARY $NATIVE_CONFIG
-Restart=on-failure
-RestartSec=2
-LimitNOFILE=65536
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-
-wait_service_active() {
-  local service="$1"
-  local i
-  for i in $(seq 1 20); do
-    if systemctl is-active --quiet "$service" 2>/dev/null; then
-      return 0
-    fi
-    sleep 1
-  done
-  return 1
-}
-
-wait_port_free() {
-  local regex="$1"
-  local i
-  for i in $(seq 1 20); do
-    if ! ss -ltnp 2>/dev/null | grep -qE "$regex"; then
-      return 0
-    fi
-    sleep 1
-  done
-  return 1
-}
-
-ensure_docker_ready() {
-  docker_client_available || die "Команда docker не найдена"
-  docker_compose_available || die "Docker Compose v2 не найден"
-
-  if systemctl list-unit-files | grep -q '^docker\.service'; then
-    systemctl start docker >/dev/null 2>&1 || true
+  if ! wait_port_free 443; then
+    ss -ltnp | grep ':443' || true
+    die "Порт 443 занят"
   fi
 
-  local i
-  for i in $(seq 1 20); do
-    if [ -S /var/run/docker.sock ] && docker version >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep 1
-  done
-
-  die "Docker daemon не готов"
-}
-
-install_or_update_panel_for_service() {
-  install_base_deps
-
-  say "📦 Устанавливаем / обновляем Telemt Panel"
-  curl -fsSL https://raw.githubusercontent.com/amirotin/telemt_panel/main/install.sh | bash
-
-  [ -f "$PANEL_CONFIG" ] || die "После установки панели не найден $PANEL_CONFIG"
-
-  sync_panel_for_service
-  systemctl enable --now "$PANEL_SERVICE" 2>/dev/null || true
-}
-
-install_service_and_panel() {
-  install_base_deps
-  ensure_rust
-  load_rust_env
-
-  local version_mode domain secret
-  version_mode="$(choose_version_mode)"
-  domain="$(ask "Домен маскировки" "google.com")"
-  secret="$(openssl rand -hex 16)"
-
-  clone_telemt_source "$version_mode"
-
-  (
-    cd "$BUILD_DIR"
-    cargo build --release
-  )
-
-  install -m 0755 "$BUILD_DIR/target/release/telemt" "$NATIVE_BINARY"
-
-  create_native_config "$domain" "$secret"
-  create_native_service_unit
+  if ! wait_port_free 9091; then
+    ss -ltnp | grep ':9091' || true
+    die "Порт 9091 занят"
+  fi
 
   systemctl daemon-reload
   systemctl enable --now "$NATIVE_SERVICE"
-  wait_service_active "$NATIVE_SERVICE" || die "Telemt service не поднялся"
+  wait_service_active "$NATIVE_SERVICE" || die "telemt.service не поднялся"
+  check_native_api
 
-  install_or_update_panel_for_service
-
+  install_or_update_panel
   say "✅ Служба и панель установлены"
 }
 
-migrate_docker_to_service() {
-  ensure_docker_ready
+migrate_docker_to_service_and_panel() {
   install_base_deps
-  ensure_rust
-  load_rust_env
+  need_cmd docker
+  docker_compose_available || warn "Docker Compose v2 не найден, это не критично для миграции"
+  docker_daemon_ready || die "Docker daemon недоступен"
 
-  [ -f "$DOCKER_CONFIG" ] || die "Не найден Docker-конфиг: $DOCKER_CONFIG"
+  local docker_cfg
+  docker_cfg="$(detect_docker_config_source)"
+  [ -f "$docker_cfg" ] || die "Не найден docker config.toml: $docker_cfg"
 
-  local version_mode
-  version_mode="$(choose_version_mode)"
+  cp "$docker_cfg" "$docker_cfg.bak.$(date +%F-%H%M%S)"
+  say "💾 Бэкап docker-конфига создан: $docker_cfg.bak.*"
 
-  clone_telemt_source "$version_mode"
+  download_latest_telemt
+  prepare_user_and_dirs
 
-  (
-    cd "$BUILD_DIR"
-    cargo build --release
-  )
+  cp "$docker_cfg" "$NATIVE_CONFIG"
+  patch_native_api_config
+  fix_native_permissions
+  write_service_unit
 
-  install -m 0755 "$BUILD_DIR/target/release/telemt" "$NATIVE_BINARY"
+  stop_only_telemt_docker
 
-  mkdir -p "$NATIVE_DIR"
-  cp "$DOCKER_CONFIG" "$NATIVE_CONFIG"
-  chmod 600 "$NATIVE_CONFIG"
-  ensure_native_api_config
-
-  if [ -f "$DOCKER_COMPOSE_FILE" ]; then
-    (
-      cd "$WORK_DIR"
-      docker compose down >/dev/null 2>&1 || true
-    )
+  if ! wait_port_free 443; then
+    ss -ltnp | grep ':443' || true
+    die "Порт 443 не освободился"
   fi
 
-  docker rm -f "$DOCKER_CONTAINER" >/dev/null 2>&1 || true
-
-  if ! wait_port_free ':(443|9091)\b'; then
-    warn "Порты 443/9091 ещё заняты:"
-    ss -ltnp 2>/dev/null | grep -E ':(443|9091)\b' || true
-    die "Не удалось освободить порты перед запуском службы"
+  if ! wait_port_free 9091; then
+    ss -ltnp | grep ':9091' || true
+    die "Порт 9091 не освободился"
   fi
-
-  create_native_service_unit
 
   systemctl daemon-reload
   systemctl enable --now "$NATIVE_SERVICE"
-  wait_service_active "$NATIVE_SERVICE" || die "После миграции служба Telemt не поднялась"
+  wait_service_active "$NATIVE_SERVICE" || die "telemt.service не поднялся после миграции"
+  check_native_api
 
-  if panel_exists; then
-    sync_panel_for_service
-  else
-    install_or_update_panel_for_service
-  fi
+  install_or_update_panel
+  remove_only_telemt_docker_traces
 
-  say "✅ Миграция Docker → служба завершена"
-}
-
-deep_cleanup_keep_amnezia() {
-  say "🧹 Глубокая очистка мусора без удаления Amnezia"
-
-  apt-get clean
-  apt-get autoremove -y || true
-  journalctl --vacuum-time=7d || true
-
-  rm -rf /tmp/* /var/tmp/* 2>/dev/null || true
-  rm -rf "$BUILD_DIR" 2>/dev/null || true
-  rm -rf "$HOME/.cargo/registry" "$HOME/.cargo/git" 2>/dev/null || true
-
-  if docker_client_available && systemctl is-active --quiet docker 2>/dev/null; then
-    docker container prune -f || true
-    docker image prune -f || true
-    docker builder prune -a -f || true
-  else
-    warn "Docker daemon не запущен, docker-prune пропущен"
-  fi
-
-  say "✅ Очистка завершена"
-  df -h /
+  say "✅ Миграция Docker → служба и установка панели завершены"
 }
 
 show_current_links() {
-  say "📊 Статус Telemt"
+  say "📊 Статус"
 
   if service_exists; then
     if service_active; then
-      say "• Служба: active"
+      say "• Служба telemt: active"
     else
-      say "• Служба: installed, inactive"
+      say "• Служба telemt: installed, inactive"
     fi
   else
-    say "• Служба: не установлена"
+    say "• Служба telemt: не установлена"
   fi
 
   if panel_exists; then
@@ -560,50 +540,9 @@ show_current_links() {
 
   if [ -f "$NATIVE_CONFIG" ]; then
     print_links_for_cfg "$NATIVE_CONFIG"
-  elif [ -f "$DOCKER_CONFIG" ]; then
-    print_links_for_cfg "$DOCKER_CONFIG"
   else
-    warn "Конфиг Telemt не найден"
+    warn "Не найден $NATIVE_CONFIG"
   fi
-}
-
-delete_all_telemt() {
-  local confirm
-  confirm="$(ask "Точно удалить весь Telemt и панель? (yes/no)" "no")"
-  [ "$confirm" = "yes" ] || {
-    say "Отменено"
-    return 0
-  }
-
-  systemctl stop "$PANEL_SERVICE" 2>/dev/null || true
-  systemctl disable "$PANEL_SERVICE" 2>/dev/null || true
-  rm -f "/etc/systemd/system/${PANEL_SERVICE}.service"
-  rm -f "$PANEL_BINARY"
-  rm -rf "$PANEL_DIR"
-
-  systemctl stop "$NATIVE_SERVICE" 2>/dev/null || true
-  systemctl disable "$NATIVE_SERVICE" 2>/dev/null || true
-  rm -f "/etc/systemd/system/${NATIVE_SERVICE}.service"
-  rm -f "$NATIVE_BINARY"
-  rm -rf "$NATIVE_DIR"
-
-  if docker_client_available; then
-    if docker_compose_available && [ -f "$DOCKER_COMPOSE_FILE" ]; then
-      (
-        cd "$WORK_DIR"
-        docker compose down >/dev/null 2>&1 || true
-      )
-    fi
-    docker rm -f "$DOCKER_CONTAINER" >/dev/null 2>&1 || true
-    docker image rm -f "$DOCKER_IMAGE" >/dev/null 2>&1 || true
-  fi
-
-  rm -rf "$WORK_DIR"
-
-  systemctl daemon-reload
-  systemctl reset-failed "$NATIVE_SERVICE" "$PANEL_SERVICE" 2>/dev/null || true
-
-  say "✅ Всё, что связано с Telemt, удалено"
 }
 
 show_menu() {
@@ -612,10 +551,9 @@ show_menu() {
   say " 🛠️  Telemt Service Manager"
   say "═════════════════════════════════════════════════════"
   say "1) Установить службу + панель"
-  say "2) Миграция Docker → служба"
-  say "3) Глубокая очистка мусора"
+  say "2) Миграция Docker → служба + установка панели"
+  say "3) Очистка мусора (безопасная)"
   say "4) Показать текущие ссылки"
-  say "5) Удалить весь Telemt"
   say "0) Выход"
 }
 
@@ -632,19 +570,15 @@ main_loop() {
         pause
         ;;
       2)
-        migrate_docker_to_service
+        migrate_docker_to_service_and_panel
         pause
         ;;
       3)
-        deep_cleanup_keep_amnezia
+        safe_cleanup_keep_amnezia
         pause
         ;;
       4)
         show_current_links
-        pause
-        ;;
-      5)
-        delete_all_telemt
         pause
         ;;
       0)
