@@ -258,9 +258,8 @@ EOF
   curl -fsS http://127.0.0.1:9091/v1/users | jq >/dev/null
 
   echo "📥 Скачиваем Telemt Panel"
-  local PANEL_JSON PANEL_TAG PANEL_URL TMPDIR_PANEL PANEL_EXTRACTED
+  local PANEL_JSON PANEL_URL TMPDIR_PANEL PANEL_EXTRACTED
   PANEL_JSON="$(curl -fsSL https://api.github.com/repos/amirotin/telemt_panel/releases/latest)"
-  PANEL_TAG="$(printf '%s' "$PANEL_JSON" | jq -r '.tag_name')"
   PANEL_URL="$(printf '%s' "$PANEL_JSON" | jq -r --arg a "$ARCH" '.assets[]?.browser_download_url | select(test("telemt-panel-" + $a + "-linux-gnu\\.tar\\.gz$"))' | head -n1)"
   [ -n "$PANEL_URL" ] || { echo "❌ Не удалось найти бинарник telemt-panel под $ARCH"; exit 1; }
 
@@ -282,12 +281,23 @@ EditionIDs GeoLite2-City GeoLite2-ASN
 DatabaseDirectory ${PANEL_DATA_DIR}
 EOF
 
-  geoipupdate
+  local GEOIP_OK=0
+  if timeout 180 geoipupdate; then
+    if [ -f "${PANEL_DATA_DIR}/GeoLite2-City.mmdb" ] && [ -f "${PANEL_DATA_DIR}/GeoLite2-ASN.mmdb" ]; then
+      GEOIP_OK=1
+      echo "✅ GeoIP базы скачаны"
+    else
+      echo "⚠️ geoipupdate завершился, но базы не найдены — продолжим без GeoIP"
+    fi
+  else
+    echo "⚠️ GeoIP не скачался автоматически, продолжим без него"
+  fi
 
   local PASS_HASH
   PASS_HASH="$("${PANEL_BIN}" hash-password "${PANEL_PASS}")"
 
-  cat > "${PANEL_CONFIG}" <<EOF
+  if [ "${GEOIP_OK}" -eq 1 ]; then
+    cat > "${PANEL_CONFIG}" <<EOF
 listen = "0.0.0.0:8080"
 
 [telemt]
@@ -311,6 +321,28 @@ password_hash = "${PASS_HASH}"
 jwt_secret = "${JWT_SECRET}"
 session_ttl = "24h"
 EOF
+  else
+    cat > "${PANEL_CONFIG}" <<EOF
+listen = "0.0.0.0:8080"
+
+[telemt]
+url = "http://127.0.0.1:9091"
+auth_header = ""
+binary_path = "/bin/telemt"
+service_name = "telemt"
+
+[panel]
+binary_path = "/usr/local/bin/telemt-panel"
+service_name = "telemt-panel"
+github_repo = "amirotin/telemt_panel"
+
+[auth]
+username = "${PANEL_USER}"
+password_hash = "${PASS_HASH}"
+jwt_secret = "${JWT_SECRET}"
+session_ttl = "24h"
+EOF
+  fi
 
   chmod 600 "${PANEL_CONFIG}"
 
@@ -362,6 +394,11 @@ EOF
   fi
   echo "Panel login:    ${PANEL_USER}"
   echo "Panel password: ${PANEL_PASS}"
+  if [ "${GEOIP_OK}" -eq 0 ]; then
+    echo "GeoIP:          не скачался автоматически, можно добить позже"
+  else
+    echo "GeoIP:          настроен"
+  fi
   echo "═════════════════════════════════════════════════════"
 }
 
