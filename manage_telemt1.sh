@@ -20,6 +20,41 @@ ask() {
   fi
 }
 
+ask_required() {
+  local prompt="$1"
+  local val=""
+  while [ -z "$val" ]; do
+    read -r -p "$prompt: " val
+    val="${val//$'\r'/}"
+    [ -n "$val" ] || echo "❌ Поле не может быть пустым"
+  done
+  printf '%s' "$val"
+}
+
+ask_yes_no() {
+  local prompt="$1"
+  local default="${2:-y}"
+  local answer
+  local shown="[Y/n]"
+  [ "$default" = "n" ] && shown="[y/N]"
+
+  while true; do
+    read -r -p "$prompt $shown: " answer
+    answer="${answer//$'\r'/}"
+    answer="${answer,,}"
+
+    if [ -z "$answer" ]; then
+      answer="$default"
+    fi
+
+    case "$answer" in
+      y|yes) echo "yes"; return 0 ;;
+      n|no) echo "no"; return 0 ;;
+      *) echo "Введите y или n" ;;
+    esac
+  done
+}
+
 pause() {
   echo
   read -r -p "Нажми Enter, чтобы продолжить..." _
@@ -71,22 +106,28 @@ public_ip() {
 
 install_stack() {
   echo "═════════════════════════════════════════════════════"
-  echo " Установка Telemt + Panel + GeoIP"
+  echo " Установка Telemt + Panel"
   echo "═════════════════════════════════════════════════════"
 
-  local MASK_DOMAIN MM_ACCOUNT_ID MM_LICENSE_KEY
+  local MASK_DOMAIN GEOIP_CHOICE MM_ACCOUNT_ID="" MM_LICENSE_KEY=""
   MASK_DOMAIN="$(ask 'Под какой домен маскироваться' 'drive.google.com')"
-  MM_ACCOUNT_ID="$(ask 'MaxMind Account ID')"
-  MM_LICENSE_KEY="$(ask 'MaxMind License Key')"
+
+  GEOIP_CHOICE="$(ask_yes_no 'Включить GeoIP для панели? (показывает страну/город/ASN пользователей)' 'y')"
+  if [ "$GEOIP_CHOICE" = "yes" ]; then
+    MM_ACCOUNT_ID="$(ask_required 'MaxMind Account ID')"
+    MM_LICENSE_KEY="$(ask_required 'MaxMind License Key')"
+  else
+    echo "ℹ️ GeoIP будет пропущен: Telemt и панель будут работать нормально,"
+    echo "   просто в панели не будут показываться страна / город / ASN пользователей."
+  fi
 
   local TELEMT_USER_NAME="hello"
   local TELEMT_SECRET
   TELEMT_SECRET="$(openssl rand -hex 16)"
 
-  local PANEL_USER="admin"
-  local PANEL_PASS
-  PANEL_PASS="$(openssl rand -base64 24 | tr -d '/+=\n' | cut -c1-20)"
-  local JWT_SECRET
+  local PANEL_USER PANEL_PASS JWT_SECRET
+  PANEL_USER="$(ask 'Логин для панели' 'admin')"
+  PANEL_PASS="$(ask_required 'Пароль для панели')"
   JWT_SECRET="$(openssl rand -hex 32)"
 
   local TELEMT_BIN="/bin/telemt"
@@ -111,7 +152,11 @@ install_stack() {
   echo "📦 Ставим зависимости"
   apt install -y \
     ca-certificates curl jq openssl python3 tar xz-utils \
-    geoipupdate xxd apache2-utils
+    xxd apache2-utils
+
+  if [ "$GEOIP_CHOICE" = "yes" ]; then
+    apt install -y geoipupdate
+  fi
 
   if systemctl list-unit-files | grep -q '^telemt\.service'; then
     systemctl stop telemt 2>/dev/null || true
@@ -273,24 +318,26 @@ EOF
 
   mkdir -p "${PANEL_CONFIG_DIR}" "${PANEL_DATA_DIR}"
 
-  echo "🌍 Настраиваем GeoIP"
-  cat > /etc/GeoIP.conf <<EOF
+  local GEOIP_OK=0
+  if [ "$GEOIP_CHOICE" = "yes" ]; then
+    echo "🌍 Настраиваем GeoIP"
+    cat > /etc/GeoIP.conf <<EOF
 AccountID ${MM_ACCOUNT_ID}
 LicenseKey ${MM_LICENSE_KEY}
 EditionIDs GeoLite2-City GeoLite2-ASN
 DatabaseDirectory ${PANEL_DATA_DIR}
 EOF
 
-  local GEOIP_OK=0
-  if timeout 180 geoipupdate; then
-    if [ -f "${PANEL_DATA_DIR}/GeoLite2-City.mmdb" ] && [ -f "${PANEL_DATA_DIR}/GeoLite2-ASN.mmdb" ]; then
-      GEOIP_OK=1
-      echo "✅ GeoIP базы скачаны"
+    if timeout 180 geoipupdate; then
+      if [ -f "${PANEL_DATA_DIR}/GeoLite2-City.mmdb" ] && [ -f "${PANEL_DATA_DIR}/GeoLite2-ASN.mmdb" ]; then
+        GEOIP_OK=1
+        echo "✅ GeoIP базы скачаны"
+      else
+        echo "⚠️ geoipupdate завершился, но базы не найдены — продолжим без GeoIP"
+      fi
     else
-      echo "⚠️ geoipupdate завершился, но базы не найдены — продолжим без GeoIP"
+      echo "⚠️ GeoIP не скачался автоматически, продолжим без него"
     fi
-  else
-    echo "⚠️ GeoIP не скачался автоматически, продолжим без него"
   fi
 
   local PASS_HASH
@@ -369,11 +416,16 @@ EOF
   systemctl enable --now telemt-panel
   wait_service_active telemt-panel || { systemctl status telemt-panel --no-pager -l; exit 1; }
 
-  echo "⏰ Настраиваем автообновление GeoIP"
-  cat > /etc/cron.d/telemt-panel-geoip <<'EOF'
+  if [ "$GEOIP_CHOICE" = "yes" ]; then
+    echo "⏰ Настраиваем автообновление GeoIP"
+    cat > /etc/cron.d/telemt-panel-geoip <<'EOF'
 20 4 * * * root /usr/bin/geoipupdate >/var/log/geoipupdate.log 2>&1 && /bin/systemctl restart telemt-panel
 EOF
-  chmod 644 /etc/cron.d/telemt-panel-geoip
+    chmod 644 /etc/cron.d/telemt-panel-geoip
+  else
+    rm -f /etc/cron.d/telemt-panel-geoip 2>/dev/null || true
+    rm -f /etc/GeoIP.conf 2>/dev/null || true
+  fi
 
   local PUB_IP HEX_DOMAIN
   PUB_IP="$(public_ip)"
@@ -394,11 +446,16 @@ EOF
   fi
   echo "Panel login:    ${PANEL_USER}"
   echo "Panel password: ${PANEL_PASS}"
-  if [ "${GEOIP_OK}" -eq 0 ]; then
+
+  if [ "$GEOIP_CHOICE" = "no" ]; then
+    echo "GeoIP:          отключён вручную"
+    echo "                всё будет работать, просто без страны / города / ASN в панели"
+  elif [ "${GEOIP_OK}" -eq 0 ]; then
     echo "GeoIP:          не скачался автоматически, можно добить позже"
   else
     echo "GeoIP:          настроен"
   fi
+
   echo "═════════════════════════════════════════════════════"
 }
 
@@ -442,7 +499,7 @@ main_menu() {
   while true; do
     echo
     echo "═════════════════════════════════════════════════════"
-    echo " 1) Установка Telemt + Panel + GeoIP"
+    echo " 1) Установка Telemt + Panel"
     echo " 2) Полное удаление Telemt + Panel"
     echo " 0) Выход"
     echo "═════════════════════════════════════════════════════"
