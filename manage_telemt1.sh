@@ -114,6 +114,10 @@ install_stack() {
 
   GEOIP_CHOICE="$(ask_yes_no 'Включить GeoIP для панели? (показывает страну/город/ASN пользователей)' 'y')"
   if [ "$GEOIP_CHOICE" = "yes" ]; then
+    echo "ℹ️ Для GeoIP нужен бесплатный аккаунт MaxMind GeoLite и License Key."
+    echo "   Регистрация / GeoLite: https://dev.maxmind.com/geoip/geolite2-free-geolocation-data/"
+    echo "   Как создать аккаунт:   https://support.maxmind.com/knowledge-base/articles/create-a-maxmind-account"
+    echo "   Как создать ключ:      https://support.maxmind.com/knowledge-base/articles/generate-a-maxmind-license-key"
     MM_ACCOUNT_ID="$(ask_required 'MaxMind Account ID')"
     MM_LICENSE_KEY="$(ask_required 'MaxMind License Key')"
   else
