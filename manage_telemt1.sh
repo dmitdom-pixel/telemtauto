@@ -111,7 +111,7 @@ install_stack() {
   echo "📦 Ставим зависимости"
   apt install -y \
     ca-certificates curl jq openssl python3 tar xz-utils \
-    geoipupdate xxd
+    geoipupdate xxd apache2-utils
 
   if systemctl list-unit-files | grep -q '^telemt\.service'; then
     systemctl stop telemt 2>/dev/null || true
@@ -258,7 +258,7 @@ EOF
   curl -fsS http://127.0.0.1:9091/v1/users | jq >/dev/null
 
   echo "📥 Скачиваем Telemt Panel"
-  local PANEL_JSON PANEL_TAG PANEL_URL TMPDIR_PANEL
+  local PANEL_JSON PANEL_TAG PANEL_URL TMPDIR_PANEL PANEL_EXTRACTED
   PANEL_JSON="$(curl -fsSL https://api.github.com/repos/amirotin/telemt_panel/releases/latest)"
   PANEL_TAG="$(printf '%s' "$PANEL_JSON" | jq -r '.tag_name')"
   PANEL_URL="$(printf '%s' "$PANEL_JSON" | jq -r --arg a "$ARCH" '.assets[]?.browser_download_url | select(test("telemt-panel-" + $a + "-linux-gnu\\.tar\\.gz$"))' | head -n1)"
@@ -267,8 +267,9 @@ EOF
   TMPDIR_PANEL="$(mktemp -d)"
   curl -fL "$PANEL_URL" -o "${TMPDIR_PANEL}/telemt-panel.tar.gz"
   tar -xzf "${TMPDIR_PANEL}/telemt-panel.tar.gz" -C "${TMPDIR_PANEL}"
-  [ -f "${TMPDIR_PANEL}/telemt-panel" ] || { echo "❌ В архиве панели не найден бинарник"; exit 1; }
-  install -m 0755 "${TMPDIR_PANEL}/telemt-panel" "${PANEL_BIN}"
+  PANEL_EXTRACTED="${TMPDIR_PANEL}/telemt-panel-${ARCH}-linux"
+  [ -f "${PANEL_EXTRACTED}" ] || { echo "❌ В архиве панели не найден бинарник ${PANEL_EXTRACTED}"; ls -la "${TMPDIR_PANEL}"; exit 1; }
+  install -m 0755 "${PANEL_EXTRACTED}" "${PANEL_BIN}"
   rm -rf "${TMPDIR_PANEL}"
 
   mkdir -p "${PANEL_CONFIG_DIR}" "${PANEL_DATA_DIR}"
