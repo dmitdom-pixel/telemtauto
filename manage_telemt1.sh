@@ -294,7 +294,7 @@ EOF
   fi
 
   local PASS_HASH
-  PASS_HASH="$("${PANEL_BIN}" hash-password "${PANEL_PASS}")"
+  PASS_HASH="$(htpasswd -bnBC 10 "" "${PANEL_PASS}" | tr -d ':\n' | sed 's/^\$2y/\$2a/')"
 
   if [ "${GEOIP_OK}" -eq 1 ]; then
     cat > "${PANEL_CONFIG}" <<EOF
