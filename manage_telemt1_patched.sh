@@ -1,243 +1,223 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-trap 'echo "❌ Ошибка на строке $LINENO"; exit 1' ERR
+trap 'echo "❌ Ошибка на строке ${LINENO}" >&2' ERR
 
-[ "$(id -u)" -eq 0 ] || { echo "Запусти скрипт от root"; exit 1; }
+SCRIPT_NAME="$(basename "$0")"
+WORK_DIR="/tmp/telemt-install.$$"
+mkdir -p "$WORK_DIR"
 
-ask() {
-  local prompt="$1"
-  local default="${2-}"
-  local val
-  if [ -n "$default" ]; then
-    read -r -p "$prompt [$default]: " val
-    val="${val//$'\r'/}"
-    printf '%s' "${val:-$default}"
-  else
-    read -r -p "$prompt: " val
-    val="${val//$'\r'/}"
-    printf '%s' "$val"
-  fi
+cleanup() {
+  rm -rf "$WORK_DIR"
 }
+trap cleanup EXIT
 
-ask_required() {
-  local prompt="$1"
-  local val=""
-  while [ -z "$val" ]; do
-    read -r -p "$prompt: " val
-    val="${val//$'\r'/}"
-    [ -n "$val" ] || echo "❌ Поле не может быть пустым"
-  done
-  printf '%s' "$val"
-}
+log()  { echo -e "\e[1;32m[INFO]\e[0m $*"; }
+warn() { echo -e "\e[1;33m[WARN]\e[0m $*" >&2; }
+err()  { echo -e "\e[1;31m[ERR ]\e[0m $*" >&2; }
 
-ask_yes_no() {
-  local prompt="$1"
-  local default="${2:-y}"
-  local answer
-  local shown="[Y/n]"
-  [ "$default" = "n" ] && shown="[y/N]"
-
-  while true; do
-    read -r -p "$prompt $shown: " answer
-    answer="${answer//$'\r'/}"
-    answer="${answer,,}"
-
-    if [ -z "$answer" ]; then
-      answer="$default"
-    fi
-
-    case "$answer" in
-      y|yes) echo "yes"; return 0 ;;
-      n|no) echo "no"; return 0 ;;
-      *) echo "Введите y или n" ;;
-    esac
-  done
-}
-
-pause() {
-  echo
-  read -r -p "Нажми Enter, чтобы продолжить..." _
-}
-
-port_must_be_free() {
-  local port="$1"
-  if ss -ltnp 2>/dev/null | grep -q ":${port}\b"; then
-    echo "❌ Порт ${port} уже занят:"
-    ss -ltnp 2>/dev/null | grep ":${port}\b" || true
+require_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    err "Запусти скрипт от root: sudo bash $SCRIPT_NAME"
     exit 1
   fi
 }
 
-wait_service_active() {
-  local svc="$1"
-  local i
-  for i in $(seq 1 30); do
-    if systemctl is-active --quiet "$svc" 2>/dev/null; then
-      return 0
-    fi
-    sleep 1
-  done
-  return 1
+prompt() {
+  local var_name="$1"
+  local text="$2"
+  local default_value="${3:-}"
+  local value
+
+  if [[ -n "$default_value" ]]; then
+    read -r -p "$text [$default_value]: " value || true
+    value="${value:-$default_value}"
+  else
+    read -r -p "$text: " value || true
+  fi
+
+  printf -v "$var_name" '%s' "$value"
+}
+
+confirm() {
+  local text="$1"
+  local default="${2:-N}"
+  local answer
+  read -r -p "$text [$default]: " answer || true
+  answer="${answer:-$default}"
+  [[ "$answer" =~ ^[YyДд]$ ]]
 }
 
 detect_arch() {
   case "$(uname -m)" in
-    x86_64) echo "x86_64" ;;
-    aarch64|arm64) echo "aarch64" ;;
+    x86_64) TELEMT_ARCH="x86_64"; PANEL_ARCH="x86_64" ;;
+    aarch64|arm64) TELEMT_ARCH="aarch64"; PANEL_ARCH="aarch64" ;;
     *)
-      echo "❌ Неподдерживаемая архитектура: $(uname -m)"
+      err "Неподдерживаемая архитектура: $(uname -m)"
       exit 1
       ;;
   esac
 }
 
-detect_libc() {
-  if ldd --version 2>&1 | grep -qi musl; then
-    echo "musl"
+install_packages() {
+  export DEBIAN_FRONTEND=noninteractive
+  log "Обновляю индекс пакетов"
+  apt update
+
+  log "Ставлю зависимости"
+  apt install -y curl jq tar ca-certificates openssl ufw
+}
+
+fetch_latest_release_json() {
+  local repo="$1"
+  curl -fsSL \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "https://api.github.com/repos/${repo}/releases/latest"
+}
+
+select_asset() {
+  local release_json="$1"
+  local regex="$2"
+
+  echo "$release_json" | jq -r --arg re "$regex" '
+    .assets[]
+    | select(.name | test($re))
+    | [.name, .browser_download_url, (.digest // "")]
+    | @tsv
+  ' | head -n1
+}
+
+download_and_verify() {
+  local url="$1"
+  local digest="$2"
+  local out="$3"
+
+  curl -fL "$url" -o "$out"
+
+  if [[ -n "$digest" && "$digest" != "null" ]]; then
+    if [[ "$digest" =~ ^sha256:([a-fA-F0-9]{64})$ ]]; then
+      local expected="${BASH_REMATCH[1]}"
+      local actual
+      actual="$(sha256sum "$out" | awk '{print $1}')"
+      if [[ "$actual" != "$expected" ]]; then
+        err "SHA256 не совпал для $(basename "$out")"
+        err "Ожидалось: $expected"
+        err "Получено : $actual"
+        exit 1
+      fi
+      log "SHA256 OK: $(basename "$out")"
+    else
+      warn "Неизвестный формат digest '$digest', проверку пропускаю"
+    fi
   else
-    echo "gnu"
+    warn "GitHub не вернул digest для $(basename "$out"), проверку пропускаю"
   fi
 }
 
-public_ip() {
-  curl -4fsS ifconfig.me 2>/dev/null || curl -4fsS ipinfo.io/ip 2>/dev/null || true
-}
+install_telemt_binary() {
+  local release_json asset name url digest archive extract_dir
+  release_json="$(fetch_latest_release_json "telemt/telemt")"
 
-fetch_release_json() {
-  local api_url="$1"
-  curl -fsSL "$api_url"
-}
-
-release_asset_url() {
-  local json="$1"
-  local regex="$2"
-  jq -r --arg re "$regex" '.assets[] | select(.browser_download_url | test($re)) | .browser_download_url' <<<"$json" | head -n1
-}
-
-release_asset_digest() {
-  local json="$1"
-  local regex="$2"
-  jq -r --arg re "$regex" '.assets[] | select(.browser_download_url | test($re)) | .digest // empty' <<<"$json" | head -n1
-}
-
-download_release_asset_checked() {
-  local api_url="$1"
-  local asset_regex="$2"
-  local out_file="$3"
-
-  local json url digest expected actual
-  json="$(fetch_release_json "$api_url")"
-
-  url="$(release_asset_url "$json" "$asset_regex")"
-  [ -n "$url" ] || { echo "❌ Не найден релизный файл по шаблону: $asset_regex"; exit 1; }
-
-  digest="$(release_asset_digest "$json" "$asset_regex")"
-  [ -n "$digest" ] || { echo "❌ Не найден SHA256 digest для: $asset_regex"; exit 1; }
-
-  echo "⬇️  Скачиваем: $url"
-  curl -fL "$url" -o "$out_file"
-
-  expected="${digest#sha256:}"
-  actual="$(sha256sum "$out_file" | awk '{print $1}')"
-
-  if [ "$actual" != "$expected" ]; then
-    echo "❌ SHA256 не совпал для $(basename "$out_file")"
-    echo "Ожидалось: $expected"
-    echo "Получено:  $actual"
+  asset="$(select_asset "$release_json" "^telemt-${TELEMT_ARCH}-linux-gnu\\.tar\\.gz$")"
+  if [[ -z "$asset" ]]; then
+    asset="$(select_asset "$release_json" "^telemt-${TELEMT_ARCH}-linux-musl\\.tar\\.gz$")"
+  fi
+  if [[ -z "$asset" ]]; then
+    err "Не найден архив telemt под архитектуру ${TELEMT_ARCH}"
     exit 1
   fi
 
-  echo "✅ SHA256 совпал: $(basename "$out_file")"
+  IFS=$'\t' read -r name url digest <<<"$asset"
+  archive="$WORK_DIR/$name"
+  extract_dir="$WORK_DIR/telemt"
+
+  log "Скачиваю telemt: $name"
+  download_and_verify "$url" "$digest" "$archive"
+
+  mkdir -p "$extract_dir"
+  tar -xzf "$archive" -C "$extract_dir"
+
+  if [[ ! -f "$extract_dir/telemt" ]]; then
+    err "В архиве telemt не найден бинарник"
+    exit 1
+  fi
+
+  install -m 0755 "$extract_dir/telemt" /bin/telemt
+  /bin/telemt --version || true
 }
 
-install_stack() {
-  echo "═════════════════════════════════════════════════════"
-  echo " Установка Telemt + Panel"
-  echo "═════════════════════════════════════════════════════"
+install_panel_binary() {
+  local release_json asset name url digest archive extract_dir bin_path
+  release_json="$(fetch_latest_release_json "amirotin/telemt_panel")"
 
-  local MASK_DOMAIN GEOIP_CHOICE MM_ACCOUNT_ID="" MM_LICENSE_KEY=""
-  MASK_DOMAIN="$(ask 'Под какой домен маскироваться' 'drive.google.com')"
-
-  echo "ℹ️ Если хочешь GeoIP в панели (страна / город / ASN пользователей),"
-  echo "   заранее нужен бесплатный аккаунт MaxMind GeoLite и License Key."
-  echo "   Регистрация: https://dev.maxmind.com/geoip/geolite2-free-geolocation-data/"
-  echo
-
-  GEOIP_CHOICE="$(ask_yes_no 'Включить GeoIP для панели? (показывает страну/город/ASN пользователей)' 'y')"
-  if [ "$GEOIP_CHOICE" = "yes" ]; then
-    echo "ℹ️ Введи данные MaxMind:"
-    MM_ACCOUNT_ID="$(ask_required 'MaxMind Account ID')"
-    MM_LICENSE_KEY="$(ask_required 'MaxMind License Key')"
-  else
-    echo "ℹ️ GeoIP будет пропущен: Telemt и панель будут работать нормально,"
-    echo "   просто в панели не будут показываться страна / город / ASN пользователей."
+  asset="$(select_asset "$release_json" "^telemt-panel-${PANEL_ARCH}-linux-gnu\\.tar\\.gz$")"
+  if [[ -z "$asset" ]]; then
+    err "Не найден архив telemt-panel под архитектуру ${PANEL_ARCH}"
+    exit 1
   fi
 
-  local TELEMT_USER_NAME="hello"
-  local TELEMT_SECRET
-  TELEMT_SECRET="$(openssl rand -hex 16)"
+  IFS=$'\t' read -r name url digest <<<"$asset"
+  archive="$WORK_DIR/$name"
+  extract_dir="$WORK_DIR/panel"
 
-  local PANEL_USER PANEL_PASS JWT_SECRET
-  PANEL_USER="$(ask 'Логин для панели' 'admin')"
-  PANEL_PASS="$(ask_required 'Пароль для панели')"
+  log "Скачиваю telemt-panel: $name"
+  download_and_verify "$url" "$digest" "$archive"
+
+  mkdir -p "$extract_dir"
+  tar -xzf "$archive" -C "$extract_dir"
+
+  bin_path="$(find "$extract_dir" -maxdepth 2 -type f -name 'telemt-panel*linux*' | head -n1 || true)"
+  if [[ -z "$bin_path" ]]; then
+    err "В архиве telemt-panel не найден бинарник"
+    exit 1
+  fi
+
+  install -m 0755 "$bin_path" /usr/local/bin/telemt-panel
+  /usr/local/bin/telemt-panel version || true
+}
+
+create_user_and_dirs() {
+  if ! id telemt >/dev/null 2>&1; then
+    useradd -d /opt/telemt -m -r -U -s /usr/sbin/nologin telemt
+  fi
+
+  mkdir -p /opt/telemt /etc/telemt /etc/telemt-panel /var/lib/telemt/tlsfront
+  chown -R telemt:telemt /opt/telemt /var/lib/telemt /etc/telemt
+  chmod 750 /etc/telemt
+  chmod 700 /etc/telemt-panel
+}
+
+generate_values() {
+  PANEL_USER="admin"
+  TELEMT_SECRET="$(openssl rand -hex 16)"
+  PANEL_PASSWORD="$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 16)"
   JWT_SECRET="$(openssl rand -hex 32)"
 
-  local TELEMT_BIN="/bin/telemt"
-  local TELEMT_CONFIG_DIR="/etc/telemt"
-  local TELEMT_CONFIG="${TELEMT_CONFIG_DIR}/telemt.toml"
-  local TELEMT_SERVICE_FILE="/etc/systemd/system/telemt.service"
-
-  local PANEL_BIN="/usr/local/bin/telemt-panel"
-  local PANEL_CONFIG_DIR="/etc/telemt-panel"
-  local PANEL_CONFIG="${PANEL_CONFIG_DIR}/config.toml"
-  local PANEL_DATA_DIR="/var/lib/telemt-panel"
-  local PANEL_SERVICE_FILE="/etc/systemd/system/telemt-panel.service"
-
-  export DEBIAN_FRONTEND=noninteractive
-
-  echo "📦 Обновляем индексы пакетов"
-  apt update
-
-  echo "📦 Ставим зависимости"
-  apt install -y ca-certificates curl jq openssl tar
-
-  if [ "$GEOIP_CHOICE" = "yes" ]; then
-    apt install -y geoipupdate
+  if [[ -z "${PUBLIC_IP:-}" ]]; then
+    PUBLIC_IP="$(curl -4 -fsSL https://api.ipify.org || true)"
   fi
 
-  if systemctl list-unit-files | grep -q '^telemt\.service'; then
-    systemctl stop telemt 2>/dev/null || true
-  fi
-  if systemctl list-unit-files | grep -q '^telemt-panel\.service'; then
-    systemctl stop telemt-panel 2>/dev/null || true
+  if [[ -z "${PUBLIC_IP:-}" ]]; then
+    prompt PUBLIC_IP "Не удалось автоопределить внешний IP. Введи IP сервера"
   fi
 
-  port_must_be_free 443
-  port_must_be_free 8080
-  port_must_be_free 9091
+  prompt MASK_DOMAIN "Домен для маскировки telemt" "ya.ru"
+}
 
-  local ARCH LIBC_KIND
-  ARCH="$(detect_arch)"
-  LIBC_KIND="$(detect_libc)"
+generate_panel_hash() {
+  local output
+  output="$(printf '%s\n' "$PANEL_PASSWORD" | /usr/local/bin/telemt-panel hash-password 2>/dev/null | tr -d '\r' || true)"
+  PANEL_HASH="$(printf '%s\n' "$output" | grep -E '^\$2[aby]\$' | tail -n1 || true)"
 
-  echo "📥 Скачиваем Telemt"
-  local TMPDIR_TELEMT
-  TMPDIR_TELEMT="$(mktemp -d)"
-  download_release_asset_checked \
-    "https://api.github.com/repos/telemt/telemt/releases/latest" \
-    "telemt-${ARCH}-linux-${LIBC_KIND}\\.tar\\.gz$" \
-    "${TMPDIR_TELEMT}/telemt.tar.gz"
-  tar -xzf "${TMPDIR_TELEMT}/telemt.tar.gz" -C "${TMPDIR_TELEMT}"
-  [ -f "${TMPDIR_TELEMT}/telemt" ] || { echo "❌ В архиве Telemt не найден бинарник"; exit 1; }
-  install -m 0755 "${TMPDIR_TELEMT}/telemt" "${TELEMT_BIN}"
-  rm -rf "${TMPDIR_TELEMT}"
+  if [[ -z "$PANEL_HASH" ]]; then
+    err "Не удалось получить bcrypt-хеш через telemt-panel hash-password"
+    exit 1
+  fi
+}
 
-  echo "👤 Создаём пользователя telemt"
-  useradd -d /opt/telemt -m -r -U telemt 2>/dev/null || true
-  mkdir -p "${TELEMT_CONFIG_DIR}"
-
-  cat > "${TELEMT_CONFIG}" <<EOF2
+write_telemt_config() {
+  cat > /etc/telemt/telemt.toml <<EOF
 [general]
 use_middle_proxy = false
 log_level = "normal"
@@ -249,31 +229,63 @@ tls = true
 
 [general.links]
 show = "*"
+public_host = "${PUBLIC_IP}"
+public_port = 443
 
 [server]
 port = 443
-
-[censorship]
-tls_domain = "${MASK_DOMAIN}"
-mask = true
-tls_emulation = true
-
-[access.users]
-${TELEMT_USER_NAME} = "${TELEMT_SECRET}"
 
 [server.api]
 enabled = true
 listen = "127.0.0.1:9091"
 whitelist = ["127.0.0.1/32"]
-minimal_runtime_enabled = false
-minimal_runtime_cache_ttl_ms = 1000
-EOF2
 
-  chown -R telemt:telemt "${TELEMT_CONFIG_DIR}"
-  chmod 750 "${TELEMT_CONFIG_DIR}"
-  chmod 640 "${TELEMT_CONFIG}"
+[[server.listeners]]
+ip = "0.0.0.0"
 
-  cat > "${TELEMT_SERVICE_FILE}" <<'EOF2'
+[censorship]
+tls_domain = "${MASK_DOMAIN}"
+mask = true
+tls_emulation = true
+tls_front_dir = "/var/lib/telemt/tlsfront"
+
+[access.users]
+main = "${TELEMT_SECRET}"
+EOF
+
+  chown telemt:telemt /etc/telemt/telemt.toml
+  chmod 640 /etc/telemt/telemt.toml
+}
+
+write_panel_config() {
+  cat > /etc/telemt-panel/config.toml <<EOF
+listen = "0.0.0.0:8080"
+
+[telemt]
+url = "http://127.0.0.1:9091"
+auth_header = ""
+binary_path = "/bin/telemt"
+service_name = "telemt"
+github_repo = "telemt/telemt"
+config_path = "/etc/telemt/telemt.toml"
+
+[panel]
+binary_path = "/usr/local/bin/telemt-panel"
+service_name = "telemt-panel"
+github_repo = "amirotin/telemt_panel"
+
+[auth]
+username = "${PANEL_USER}"
+password_hash = "${PANEL_HASH}"
+jwt_secret = "${JWT_SECRET}"
+session_ttl = "24h"
+EOF
+
+  chmod 600 /etc/telemt-panel/config.toml
+}
+
+write_telemt_service() {
+  cat > /etc/systemd/system/telemt.service <<'EOF'
 [Unit]
 Description=Telemt
 After=network-online.target
@@ -286,7 +298,7 @@ Group=telemt
 WorkingDirectory=/opt/telemt
 ExecStart=/bin/telemt /etc/telemt/telemt.toml
 Restart=on-failure
-RestartSec=2
+RestartSec=3
 LimitNOFILE=65536
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
@@ -294,114 +306,15 @@ NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
-EOF2
+EOF
+}
 
-  echo "🚀 Запускаем Telemt"
-  systemctl daemon-reload
-  systemctl enable --now telemt
-  wait_service_active telemt || { systemctl status telemt --no-pager -l; exit 1; }
-
-  echo "🧪 Проверяем API Telemt"
-  curl -fsS http://127.0.0.1:9091/v1/users | jq >/dev/null
-
-  echo "📥 Скачиваем Telemt Panel"
-  local TMPDIR_PANEL PANEL_EXTRACTED
-  TMPDIR_PANEL="$(mktemp -d)"
-  download_release_asset_checked \
-    "https://api.github.com/repos/amirotin/telemt_panel/releases/latest" \
-    "telemt-panel-${ARCH}-linux-gnu\\.tar\\.gz$" \
-    "${TMPDIR_PANEL}/telemt-panel.tar.gz"
-  tar -xzf "${TMPDIR_PANEL}/telemt-panel.tar.gz" -C "${TMPDIR_PANEL}"
-  PANEL_EXTRACTED="${TMPDIR_PANEL}/telemt-panel-${ARCH}-linux"
-  [ -f "${PANEL_EXTRACTED}" ] || { echo "❌ В архиве панели не найден бинарник ${PANEL_EXTRACTED}"; ls -la "${TMPDIR_PANEL}"; exit 1; }
-  install -m 0755 "${PANEL_EXTRACTED}" "${PANEL_BIN}"
-  rm -rf "${TMPDIR_PANEL}"
-
-  mkdir -p "${PANEL_CONFIG_DIR}" "${PANEL_DATA_DIR}"
-
-  local GEOIP_OK=0
-  if [ "$GEOIP_CHOICE" = "yes" ]; then
-    echo "🌍 Настраиваем GeoIP"
-    cat > /etc/GeoIP.conf <<EOF2
-AccountID ${MM_ACCOUNT_ID}
-LicenseKey ${MM_LICENSE_KEY}
-EditionIDs GeoLite2-City GeoLite2-ASN
-DatabaseDirectory ${PANEL_DATA_DIR}
-EOF2
-
-    if timeout 180 geoipupdate; then
-      if [ -f "${PANEL_DATA_DIR}/GeoLite2-City.mmdb" ] && [ -f "${PANEL_DATA_DIR}/GeoLite2-ASN.mmdb" ]; then
-        GEOIP_OK=1
-        echo "✅ GeoIP базы скачаны"
-      else
-        echo "⚠️ geoipupdate завершился, но базы не найдены — продолжим без GeoIP"
-      fi
-    else
-      echo "⚠️ GeoIP не скачался автоматически, продолжим без GeoIP"
-    fi
-  fi
-
-  local PASS_HASH
-  PASS_HASH="$(printf '%s\n' "${PANEL_PASS}" | "${PANEL_BIN}" hash-password)"
-
-  if [ "${GEOIP_OK}" -eq 1 ]; then
-    cat > "${PANEL_CONFIG}" <<EOF2
-listen = "0.0.0.0:8080"
-
-[telemt]
-url = "http://127.0.0.1:9091"
-auth_header = ""
-binary_path = "/bin/telemt"
-service_name = "telemt"
-github_repo = "telemt/telemt"
-config_path = "/etc/telemt/telemt.toml"
-
-[panel]
-binary_path = "/usr/local/bin/telemt-panel"
-service_name = "telemt-panel"
-github_repo = "amirotin/telemt_panel"
-
-[geoip]
-db_path = "/var/lib/telemt-panel/GeoLite2-City.mmdb"
-asn_db_path = "/var/lib/telemt-panel/GeoLite2-ASN.mmdb"
-
-[auth]
-username = "${PANEL_USER}"
-password_hash = "${PASS_HASH}"
-jwt_secret = "${JWT_SECRET}"
-session_ttl = "24h"
-EOF2
-  else
-    cat > "${PANEL_CONFIG}" <<EOF2
-listen = "0.0.0.0:8080"
-
-[telemt]
-url = "http://127.0.0.1:9091"
-auth_header = ""
-binary_path = "/bin/telemt"
-service_name = "telemt"
-github_repo = "telemt/telemt"
-config_path = "/etc/telemt/telemt.toml"
-
-[panel]
-binary_path = "/usr/local/bin/telemt-panel"
-service_name = "telemt-panel"
-github_repo = "amirotin/telemt_panel"
-
-[auth]
-username = "${PANEL_USER}"
-password_hash = "${PASS_HASH}"
-jwt_secret = "${JWT_SECRET}"
-session_ttl = "24h"
-EOF2
-  fi
-
-  chmod 600 "${PANEL_CONFIG}"
-
-  cat > "${PANEL_SERVICE_FILE}" <<'EOF2'
+write_panel_service() {
+  cat > /etc/systemd/system/telemt-panel.service <<'EOF'
 [Unit]
 Description=Telemt Panel
-After=network.target
+After=network.target telemt.service
+Wants=telemt.service
 
 [Service]
 Type=simple
@@ -414,120 +327,139 @@ ProtectHome=true
 
 [Install]
 WantedBy=multi-user.target
-EOF2
+EOF
+}
 
-  echo "🚀 Запускаем Telemt Panel"
-  systemctl daemon-reload
-  systemctl enable --now telemt-panel
-  wait_service_active telemt-panel || { systemctl status telemt-panel --no-pager -l; exit 1; }
-
-  if [ "${GEOIP_OK}" -eq 1 ]; then
-    echo "⏰ Настраиваем автообновление GeoIP"
-    cat > /etc/cron.d/telemt-panel-geoip <<'EOF2'
-20 4 * * * root /usr/bin/geoipupdate >/var/log/geoipupdate.log 2>&1 && /bin/systemctl restart telemt-panel
-EOF2
-    chmod 644 /etc/cron.d/telemt-panel-geoip
-  else
-    rm -f /etc/cron.d/telemt-panel-geoip 2>/dev/null || true
-    [ "$GEOIP_CHOICE" = "yes" ] || rm -f /etc/GeoIP.conf 2>/dev/null || true
+configure_firewall() {
+  if ! command -v ufw >/dev/null 2>&1; then
+    return 0
   fi
 
-  local PUB_IP
-  PUB_IP="$(public_ip)"
+  if confirm "Открыть порты 22, 443 и 8080 через UFW?" "Y"; then
+    ufw allow 22/tcp || true
+    ufw allow 443/tcp || true
+    ufw allow 8080/tcp || true
+    if ufw status | grep -q inactive; then
+      ufw --force enable
+    else
+      ufw reload || true
+    fi
+  fi
+}
+
+start_services() {
+  systemctl daemon-reload
+  systemctl enable --now telemt
+  systemctl restart telemt
+
+  systemctl enable --now telemt-panel
+  systemctl restart telemt-panel
+}
+
+show_result() {
+  local user_json tg_links
+  echo
+  echo "=============================================="
+  echo "Telemt и панель установлены"
+  echo "=============================================="
+  echo "Panel URL     : http://${PUBLIC_IP}:8080/"
+  echo "Panel user    : ${PANEL_USER}"
+  echo "Panel password: ${PANEL_PASSWORD}"
+  echo "Telemt secret : ${TELEMT_SECRET}"
+  echo "Mask domain   : ${MASK_DOMAIN}"
+  echo
+
+  echo "Проверка сервисов:"
+  systemctl --no-pager --full status telemt telemt-panel | sed -n '1,80p' || true
+  echo
+
+  echo "Пользователи telemt через API:"
+  user_json="$(curl -fsSL http://127.0.0.1:9091/v1/users 2>/dev/null || true)"
+  if [[ -n "$user_json" ]]; then
+    echo "$user_json" | jq . || echo "$user_json"
+
+    tg_links="$(echo "$user_json" | jq -r '.. | strings | select(startswith("tg://proxy") or startswith("https://t.me/proxy"))' 2>/dev/null || true)"
+    if [[ -n "$tg_links" ]]; then
+      echo
+      echo "Найденные proxy-ссылки:"
+      echo "$tg_links"
+    fi
+  else
+    warn "API telemt пока не ответил. Проверь: journalctl -u telemt -n 100 --no-pager"
+  fi
 
   echo
-  echo "═════════════════════════════════════════════════════"
-  echo "✅ Готово"
-  echo "Mask domain:    ${MASK_DOMAIN}"
-  echo "Telemt user:    ${TELEMT_USER_NAME}"
-  echo "Telemt secret:  ${TELEMT_SECRET}"
-  if [ -n "${PUB_IP}" ]; then
-    echo "Panel URL:      http://${PUB_IP}:8080"
-  else
-    echo "Не удалось определить внешний IP"
-  fi
-  echo "Panel login:    ${PANEL_USER}"
-  echo "Panel password: ${PANEL_PASS}"
-
-  if [ "$GEOIP_CHOICE" = "no" ]; then
-    echo "GeoIP:          отключён вручную"
-    echo "                всё будет работать, просто без страны / города / ASN в панели"
-  elif [ "${GEOIP_OK}" -eq 0 ]; then
-    echo "GeoIP:          не скачался автоматически, можно добить позже"
-  else
-    echo "GeoIP:          настроен"
-  fi
-
-  echo "─────────────────────────────────────────────────────"
-  echo "Ссылки Telemt из API:"
-  curl -fsS http://127.0.0.1:9091/v1/users | jq || true
-  echo "═════════════════════════════════════════════════════"
+  echo "Полезные команды:"
+  echo "  journalctl -u telemt -n 100 --no-pager"
+  echo "  journalctl -u telemt-panel -n 100 --no-pager"
+  echo "  curl -s http://127.0.0.1:9091/v1/users | jq"
+  echo "  ss -ltnp | egrep ':443|:8080|:9091'"
 }
 
-delete_stack() {
-  echo "═════════════════════════════════════════════════════"
-  echo " Полное удаление Telemt + Panel"
-  echo "═════════════════════════════════════════════════════"
+install_all() {
+  require_root
+  detect_arch
+  install_packages
+  install_telemt_binary
+  install_panel_binary
+  create_user_and_dirs
+  generate_values
+  generate_panel_hash
+  write_telemt_config
+  write_panel_config
+  write_telemt_service
+  write_panel_service
+  configure_firewall
+  start_services
+  show_result
+}
 
-  read -r -p "Точно удалить Telemt, telemt-panel, конфиги и GeoIP-файлы? [yes/no]: " confirm
-  confirm="${confirm//$'\r'/}"
-  [ "$confirm" = "yes" ] || { echo "Отменено"; return 0; }
+uninstall_all() {
+  require_root
 
-  systemctl stop telemt-panel 2>/dev/null || true
-  systemctl disable telemt-panel 2>/dev/null || true
-  systemctl stop telemt 2>/dev/null || true
-  systemctl disable telemt 2>/dev/null || true
+  if ! confirm "Точно удалить Telemt + Panel?" "N"; then
+    echo "Отмена."
+    return 0
+  fi
 
-  rm -f /etc/systemd/system/telemt-panel.service
+  systemctl disable --now telemt-panel 2>/dev/null || true
+  systemctl disable --now telemt 2>/dev/null || true
+
   rm -f /etc/systemd/system/telemt.service
-
-  rm -f /usr/local/bin/telemt-panel
-  rm -f /bin/telemt
-
-  rm -rf /etc/telemt-panel
-  rm -rf /etc/telemt
-  rm -rf /var/lib/telemt-panel
-
-  rm -f /etc/cron.d/telemt-panel-geoip
-  rm -f /etc/GeoIP.conf
-
-  userdel -r telemt 2>/dev/null || true
-
+  rm -f /etc/systemd/system/telemt-panel.service
   systemctl daemon-reload
-  systemctl reset-failed telemt telemt-panel 2>/dev/null || true
 
-  echo "✅ Telemt и панель удалены"
-  echo "ℹ️ Пакеты curl/jq/geoipupdate не удалялись"
+  rm -f /bin/telemt
+  rm -f /usr/local/bin/telemt-panel
+
+  rm -rf /etc/telemt /etc/telemt-panel /var/lib/telemt /opt/telemt
+
+  if id telemt >/dev/null 2>&1; then
+    userdel -r telemt 2>/dev/null || true
+  fi
+
+  if command -v ufw >/dev/null 2>&1; then
+    ufw delete allow 443/tcp 2>/dev/null || true
+    ufw delete allow 8080/tcp 2>/dev/null || true
+  fi
+
+  echo "Удаление завершено."
 }
 
-main_menu() {
-  while true; do
-    echo
-    echo "═════════════════════════════════════════════════════"
-    echo " 1) Установка Telemt + Panel"
-    echo " 2) Полное удаление Telemt + Panel"
-    echo " 0) Выход"
-    echo "═════════════════════════════════════════════════════"
-    read -r -p "Выберите пункт: " choice
-    choice="${choice//$'\r'/}"
+menu() {
+  echo "=============================================="
+  echo "1) Установка Telemt + Panel"
+  echo "2) Полное удаление Telemt + Panel"
+  echo "0) Выход"
+  echo "=============================================="
+  read -r -p "Выбери пункт: " choice
 
-    case "$choice" in
-      1)
-        install_stack
-        pause
-        ;;
-      2)
-        delete_stack
-        pause
-        ;;
-      0)
-        exit 0
-        ;;
-      *)
-        echo "Неверный выбор"
-        ;;
-    esac
-  done
+  case "$choice" in
+    1) install_all ;;
+    2) uninstall_all ;;
+    0) exit 0 ;;
+    *) err "Неизвестный пункт меню"; exit 1 ;;
+  esac
 }
 
-main_menu
+menu
